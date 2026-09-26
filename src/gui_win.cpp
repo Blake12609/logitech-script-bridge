@@ -14,6 +14,7 @@
 #include <uxtheme.h>
 
 #include <algorithm>
+#include <objidl.h>  // GDI+ needs COM declarations that WIN32_LEAN_AND_MEAN leaves out
 namespace Gdiplus {
 using std::max;
 using std::min;
