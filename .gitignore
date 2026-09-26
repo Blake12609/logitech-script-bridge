@@ -1,6 +1,4 @@
-__pycache__/
-*.pyc
-*.egg-info/
-build/
-dist/
-.pytest_cache/
+build*/
+.vs/
+out/
+*.ini
