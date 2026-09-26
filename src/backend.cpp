@@ -10,12 +10,21 @@ const char* buttonName(Button b) {
     return names[static_cast<int>(b)];
 }
 
-const DeviceInfo kDevices[4] = {
-    {Device::Makcu, "makcu", "MAKCU"},
-    {Device::Esp32, "esp32", "ESP32-S3 (bridge firmware)"},
-    {Device::Software, "software", "Software (no hardware)"},
-    {Device::DryRun, "dry-run", "Dry run (log only)"},
+const DeviceInfo kDevices[kDeviceCount] = {
+    {Device::Makcu, "makcu", "MAKCU", "Mouse only. Keys can be typed in software.", true, false},
+    {Device::KmboxB, "kmbox-b", "KMBox B / B+ / B Pro", "Mouse only. Keys can be typed in software.", true, false},
+    {Device::Esp32, "esp32", "ESP32-S3 (bridge firmware)", "Mouse + keyboard. Flash firmware/esp32s3_bridge.", true, true},
+    {Device::Arduino, "arduino", "Arduino Leonardo / Pro Micro / Pi Pico (bridge firmware)",
+     "Mouse + keyboard. Flash firmware/arduino_hid_bridge.", true, true},
+    {Device::Software, "software", "Software (no hardware)", "Windows SendInput. Many games ignore it.", false, true},
+    {Device::DryRun, "dry-run", "Dry run (log only)", "Nothing is sent; every action is written to the log.", false, true},
 };
+
+const DeviceInfo* findDevice(const std::string& key) {
+    for (const auto& d : kDevices)
+        if (key == d.key) return &d;
+    return nullptr;
+}
 
 // ---------------------------------------------------------------- dry run
 
@@ -52,7 +61,7 @@ struct SerialBackend::Drain {
 };
 
 SerialBackend::SerialBackend(std::string port, int baud, bool keyboard, bool makcuHighSpeed)
-    : port_(std::move(port)), baud_(baud), keyboard_(keyboard), highSpeed_(makcuHighSpeed) {}
+    : KmBackend(keyboard), port_(std::move(port)), baud_(baud), highSpeed_(makcuHighSpeed) {}
 
 SerialBackend::~SerialBackend() { close(); }
 
@@ -89,31 +98,35 @@ void SerialBackend::close() {
     serial_.close();
 }
 
-void SerialBackend::send(const std::string& cmd) {
+void SerialBackend::sendLine(const std::string& line) {
     std::lock_guard<std::mutex> lock(mu_);
-    serial_.write(cmd + "\r\n");
+    serial_.write(line + "\r\n");
 }
 
-void SerialBackend::move(int dx, int dy) {
-    if (dx || dy) send("km.move(" + std::to_string(dx) + "," + std::to_string(dy) + ")");
+// ---------------------------------------------------------------- km protocol
+
+void KmBackend::move(int dx, int dy) {
+    if (dx || dy) sendLine("km.move(" + std::to_string(dx) + "," + std::to_string(dy) + ")");
 }
 
-void SerialBackend::wheel(int clicks) {
-    if (clicks) send("km.wheel(" + std::to_string(clicks) + ")");
+void KmBackend::wheel(int clicks) {
+    if (clicks) sendLine("km.wheel(" + std::to_string(clicks) + ")");
 }
 
-void SerialBackend::button(Button b, bool down) {
-    send(std::string("km.") + buttonName(b) + (down ? "(1)" : "(0)"));
+void KmBackend::button(Button b, bool down) {
+    sendLine(std::string("km.") + buttonName(b) + (down ? "(1)" : "(0)"));
 }
 
-void SerialBackend::key(const KeyInfo& k, bool down) {
-    send(std::string(down ? "kb.down(" : "kb.up(") + std::to_string(k.hid) + ")");
+void KmBackend::key(const KeyInfo& k, bool down) {
+    sendLine(std::string(down ? "kb.down(" : "kb.up(") + std::to_string(k.hid) + ")");
 }
 
 std::unique_ptr<Backend> createBackend(Device d, const std::string& port, int baud) {
     switch (d) {
-        case Device::Makcu: return std::make_unique<SerialBackend>(port, baud, false);
-        case Device::Esp32: return std::make_unique<SerialBackend>(port, baud, true);
+        case Device::Makcu:
+        case Device::KmboxB: return std::make_unique<SerialBackend>(port, baud, false);
+        case Device::Esp32:
+        case Device::Arduino: return std::make_unique<SerialBackend>(port, baud, true);
         case Device::Software: return createSoftwareBackend();
         case Device::DryRun: return std::make_unique<DryRunBackend>();
     }

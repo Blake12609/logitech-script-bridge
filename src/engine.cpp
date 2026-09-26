@@ -113,6 +113,7 @@ bool Engine::start(const std::string& source, const std::string& chunkName, std:
     start_ = Clock::now();
     physical_.fill(false);
     synthetic_.fill(false);
+    extra_.fill(false);
     for (auto& e : echo_) e.clear();
 
     std::string loadError;
@@ -166,6 +167,20 @@ void Engine::onPhysicalButton(Button b, bool pressed) {
     }
     if (!running_ || (b == Button::Left && !primaryEvents_)) return;
     post({pressed ? "MOUSE_BUTTON_PRESSED" : "MOUSE_BUTTON_RELEASED", kEventButton[i], "mouse"});
+}
+
+void Engine::onExtraButton(int number, bool pressed) {
+    if (number <= kButtonCount || number > kMaxButton) return;
+    {
+        std::lock_guard<std::mutex> lock(smu_);
+        if (extra_[number] == pressed) return;  // ignore key auto-repeat
+        extra_[number] = pressed;
+    }
+    if (running_) post({pressed ? "MOUSE_BUTTON_PRESSED" : "MOUSE_BUTTON_RELEASED", number, "mouse"});
+}
+
+void Engine::onGKey(int number, bool pressed) {
+    if (running_) post({pressed ? "G_PRESSED" : "G_RELEASED", number, "kb"});
 }
 
 // ------------------------------------------------------------------ worker thread
@@ -398,10 +413,12 @@ int Engine::l_mpressed(lua_State* L) {
     Engine* e = self(L);
     Button b;
     bool pressed = false;
-    if (outputButton(toInt(L, 1), b)) {
-        std::lock_guard<std::mutex> lock(e->smu_);
+    const int n = toInt(L, 1);
+    std::lock_guard<std::mutex> lock(e->smu_);
+    if (outputButton(n, b))
         pressed = e->physical_[static_cast<int>(b)] || e->synthetic_[static_cast<int>(b)];
-    }
+    else if (n > kButtonCount && n <= kMaxButton)
+        pressed = e->extra_[n];
     lua_pushboolean(L, pressed);
     return 1;
 }

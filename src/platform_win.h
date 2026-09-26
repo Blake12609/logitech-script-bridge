@@ -11,7 +11,8 @@
 class WinInput : public InputState {
 public:
     ~WinInput() override { stopHook(); }
-    bool startHook(Engine* engine, std::string& error);
+    // extraKeys: F13-F24 become "mouse" buttons 6-17, "gkeys" G1-G12, or "off".
+    bool startHook(Engine* engine, const std::string& extraKeys, std::string& error);
     void stopHook();
 
     bool modifierPressed(const std::string& name) override;

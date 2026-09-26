@@ -67,26 +67,39 @@ private:
 
 std::vector<std::string> listSerialPorts();
 
-// MAKCU / ESP32-S3 bridge firmware. Both speak the MAKCU text protocol for the mouse:
+// The MAKCU / KMBox text protocol, one command per line:
 //   km.move(x,y)  km.wheel(n)  km.left(1|0)  km.right  km.middle  km.side1  km.side2
-// The bridge firmware (firmware/esp32s3_bridge) also accepts kb.down(hid) / kb.up(hid).
-class SerialBackend : public Backend {
+// The bridge firmwares in firmware/ also accept kb.down(hid) / kb.up(hid) for keys.
+// Subclasses decide where the lines go.
+class KmBackend : public Backend {
 public:
-    SerialBackend(std::string port, int baud, bool keyboard, bool makcuHighSpeed = false);
-    ~SerialBackend() override;
-    bool open(std::string& error) override;
-    void close() override;
+    explicit KmBackend(bool keyboard) : keyboard_(keyboard) {}
     bool supportsKeyboard() const override { return keyboard_; }
     void move(int dx, int dy) override;
     void wheel(int clicks) override;
     void button(Button b, bool down) override;
     void key(const KeyInfo& k, bool down) override;
 
+protected:
+    virtual void sendLine(const std::string& line) = 0;  // without line terminator
+
 private:
-    void send(const std::string& cmd);
+    bool keyboard_;
+};
+
+class SerialBackend : public KmBackend {
+public:
+    SerialBackend(std::string port, int baud, bool keyboard, bool makcuHighSpeed = false);
+    ~SerialBackend() override;
+    bool open(std::string& error) override;
+    void close() override;
+
+protected:
+    void sendLine(const std::string& line) override;
+
+private:
     std::string port_;
     int baud_;
-    bool keyboard_;
     bool highSpeed_;
     SerialPort serial_;
     std::mutex mu_;
@@ -94,9 +107,18 @@ private:
     std::unique_ptr<Drain> drain_;
 };
 
-enum class Device { Makcu, Esp32, Software, DryRun };
-struct DeviceInfo { Device id; const char* key; const char* label; };
-extern const DeviceInfo kDevices[4];
+enum class Device { Makcu, KmboxB, Esp32, Arduino, Software, DryRun };
+struct DeviceInfo {
+    Device id;
+    const char* key;    // used in config files
+    const char* label;
+    const char* hint;   // one line shown under the device picker
+    bool serial;        // needs a COM port
+    bool keyboard;      // can type keys itself
+};
+constexpr int kDeviceCount = 6;
+extern const DeviceInfo kDevices[kDeviceCount];
+const DeviceInfo* findDevice(const std::string& key);
 
 // Software output (SendInput on Windows). Returns nullptr where unsupported.
 std::unique_ptr<Backend> createSoftwareBackend();

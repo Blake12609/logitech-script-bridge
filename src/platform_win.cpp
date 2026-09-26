@@ -13,6 +13,28 @@
 namespace {
 
 std::atomic<Engine*> g_engine{nullptr};
+std::atomic<int> g_extraKeys{0};  // 0 off, 1 mouse buttons 6-17, 2 G-keys
+bool g_extraDown[12] = {};        // hook thread only
+
+// F13-F24 are the keys mouse software can usually assign to extra buttons.
+LRESULT CALLBACK keyboardProc(int code, WPARAM msg, LPARAM lp) {
+    Engine* e = g_engine.load();
+    const int mode = g_extraKeys.load();
+    if (code == HC_ACTION && e && mode) {
+        const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
+        if (k->vkCode >= VK_F13 && k->vkCode <= VK_F24 && !(k->flags & LLKHF_INJECTED)) {
+            const int i = static_cast<int>(k->vkCode - VK_F13);
+            const bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            if (down != g_extraDown[i]) {  // skip auto-repeat
+                g_extraDown[i] = down;
+                if (mode == 1) e->onExtraButton(6 + i, down);
+                else e->onGKey(1 + i, down);
+            }
+            return 1;  // swallow it: the key now belongs to the script
+        }
+    }
+    return CallNextHookEx(nullptr, code, msg, lp);
+}
 
 LRESULT CALLBACK mouseProc(int code, WPARAM msg, LPARAM lp) {
     Engine* e = g_engine.load();
@@ -37,24 +59,31 @@ LRESULT CALLBACK mouseProc(int code, WPARAM msg, LPARAM lp) {
 
 }  // namespace
 
-bool WinInput::startHook(Engine* engine, std::string& error) {
+bool WinInput::startHook(Engine* engine, const std::string& extraKeys, std::string& error) {
     stopHook();
     g_engine = engine;
+    g_extraKeys = extraKeys == "mouse" ? 1 : extraKeys == "gkeys" ? 2 : 0;
+    for (bool& d : g_extraDown) d = false;
     std::promise<DWORD> ready;  // 0 = hook installed, else error code
     auto started = ready.get_future();
     thread_ = std::thread([this, &ready] {
         MSG msg;
         PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // create the message queue
         HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, mouseProc, GetModuleHandleW(nullptr), 0);
+        HHOOK kbHook = g_extraKeys ? SetWindowsHookExW(WH_KEYBOARD_LL, keyboardProc, GetModuleHandleW(nullptr), 0)
+                                   : nullptr;
         threadId_ = GetCurrentThreadId();
-        ready.set_value(hook ? 0 : (GetLastError() ? GetLastError() : 1));
-        if (!hook) return;
-        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        const bool ok = hook && (kbHook || !g_extraKeys);
+        ready.set_value(ok ? 0 : (GetLastError() ? GetLastError() : 1));
+        if (ok) {
+            while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            }
         }
-        UnhookWindowsHookEx(hook);
+        if (hook) UnhookWindowsHookEx(hook);
+        if (kbHook) UnhookWindowsHookEx(kbHook);
     });
     if (DWORD code = started.get()) {
-        error = "Could not install the mouse hook (error " + std::to_string(code) + ").";
+        error = "Could not install the input hooks (error " + std::to_string(code) + ").";
         thread_.join();
         g_engine = nullptr;
         return false;

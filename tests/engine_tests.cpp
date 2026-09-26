@@ -1,4 +1,4 @@
-// Engine tests: no hardware needed, run with `ctest` or ./engine_tests
+// Engine tests: run Lua scripts against a dry-run device and fake input.
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -10,18 +10,9 @@
 
 #include "backend.h"
 #include "engine.h"
+#include "test.h"
 
 namespace {
-
-int g_failures = 0;
-
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("  FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-            g_failures++;                                                    \
-        }                                                                    \
-    } while (0)
 
 class NullInput : public InputState {
 public:
@@ -57,12 +48,12 @@ struct Harness {
         return logText;
     }
     bool logHas(const std::string& s) { return log().find(s) != std::string::npos; }
-    static void settle(int ms = 100) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+    static void settle(int ms = 100) { test::sleepMs(ms); }
 };
 
 using Sent = std::vector<std::string>;
 
-void test_profile_events_and_log() {
+TEST(profile_events_and_log) {
     Harness h(R"(function OnEvent(e, a, f) OutputLogMessage("%s %d\n", e, a) end)");
     CHECK(h.started);
     Harness::settle();
@@ -71,7 +62,7 @@ void test_profile_events_and_log() {
     CHECK(h.logHas("PROFILE_DEACTIVATED 0\n"));
 }
 
-void test_side_button_presses_key_combo() {
+TEST(side_button_presses_key_combo) {
     Harness h(R"(
     function OnEvent(event, arg)
         if event == "MOUSE_BUTTON_PRESSED" and arg == 4 then
@@ -83,13 +74,13 @@ void test_side_button_presses_key_combo() {
     CHECK((h.backend.sent() == Sent{"key 0xE0 1", "key 0x06 1", "key 0xE0 0", "key 0x06 0"}));
 }
 
-void test_scancodes_are_accepted() {
+TEST(scancodes_are_accepted) {
     Harness h(R"(function OnEvent(e) if e == "PROFILE_ACTIVATED" then PressKey(0x1E) ReleaseKey(0x1E) end end)");
     Harness::settle();
     CHECK((h.backend.sent() == Sent{"key 0x04 1", "key 0x04 0"}));
 }
 
-void test_primary_button_needs_enable() {
+TEST(primary_button_needs_enable) {
     Harness h(R"(
     function OnEvent(event, arg)
         if event == "MOUSE_BUTTON_PRESSED" then OutputLogMessage("press %d\n", arg) end
@@ -102,7 +93,7 @@ void test_primary_button_needs_enable() {
     CHECK(h.logHas("press 2"));
 }
 
-void test_button_numbering_matches_logitech() {
+TEST(button_numbering_matches_logitech) {
     // OnEvent: 2 = right, 3 = middle.  PressMouseButton/IsMouseButtonPressed: 2 = middle, 3 = right.
     Harness h(R"(
     function OnEvent(event, arg)
@@ -118,7 +109,7 @@ void test_button_numbering_matches_logitech() {
     CHECK((h.backend.sent() == Sent{"button middle 1", "button middle 0"}));
 }
 
-void test_hold_loop_runs_until_release() {
+TEST(hold_loop_runs_until_release) {
     Harness h(R"(
     function OnEvent(event, arg)
         if event == "MOUSE_BUTTON_PRESSED" and arg == 5 then
@@ -138,7 +129,7 @@ void test_hold_loop_runs_until_release() {
     CHECK(moves >= 5 && moves <= 30);
 }
 
-void test_injected_clicks_are_not_reported_back() {
+TEST(injected_clicks_are_not_reported_back) {
     Harness h(R"(
     function OnEvent(event, arg)
         if event == "PROFILE_ACTIVATED" then EnablePrimaryMouseButtonEvents(true) end
@@ -156,7 +147,7 @@ void test_injected_clicks_are_not_reported_back() {
     CHECK(!h.logHas("press 1"));
 }
 
-void test_stop_interrupts_busy_loop_and_releases() {
+TEST(stop_interrupts_busy_loop_and_releases) {
     Harness h(R"(
     function OnEvent(event, arg)
         if event == "PROFILE_ACTIVATED" then
@@ -174,7 +165,7 @@ void test_stop_interrupts_busy_loop_and_releases() {
     CHECK(s.size() == 4 && s[2] == "button left 0" && s[3] == "key 0x1A 0");
 }
 
-void test_stop_interrupts_sleep() {
+TEST(stop_interrupts_sleep) {
     Harness h(R"(function OnEvent(e) if e == "PROFILE_ACTIVATED" then Sleep(60000) end end)");
     Harness::settle();
     auto t0 = std::chrono::steady_clock::now();
@@ -182,14 +173,14 @@ void test_stop_interrupts_sleep() {
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1));
 }
 
-void test_keyboard_ignored_when_device_cannot_type() {
+TEST(keyboard_ignored_when_device_cannot_type) {
     Harness h(R"(function OnEvent(e) if e == "PROFILE_ACTIVATED" then PressAndReleaseKey("a") end end)", false);
     Harness::settle();
     CHECK(h.backend.sent().empty());
     CHECK(h.logHas("cannot send keys"));
 }
 
-void test_modifiers_and_locks() {
+TEST(modifiers_and_locks) {
     Harness h(R"(
     function OnEvent(e, a)
         if a == 4 then
@@ -205,7 +196,7 @@ void test_modifiers_and_locks() {
     CHECK(h.logHas("true false true"));
 }
 
-void test_sandbox() {
+TEST(sandbox) {
     Harness h(R"(
     OutputLogMessage("io=%s execute=%s debug=%s require=%s\n",
         tostring(io), tostring(os.execute), tostring(debug), tostring(require))
@@ -216,7 +207,7 @@ void test_sandbox() {
     CHECK(h.logHas("bytecode=false"));
 }
 
-void test_load_errors() {
+TEST(load_errors) {
     Harness a("function OnEvent(");
     CHECK(!a.started);
     CHECK(a.error.find("test.lua") != std::string::npos);
@@ -225,7 +216,7 @@ void test_load_errors() {
     CHECK(b.error.find("OnEvent") != std::string::npos);
 }
 
-void test_runtime_error_is_logged_and_script_keeps_running() {
+TEST(runtime_error_is_logged_and_script_keeps_running) {
     Harness h(R"(
     function OnEvent(e, a)
         if a == 4 then error("oops") end
@@ -238,7 +229,7 @@ void test_runtime_error_is_logged_and_script_keeps_running() {
     CHECK(h.logHas("still alive"));
 }
 
-void test_mouse_position_and_compat() {
+TEST(mouse_position_and_compat) {
     Harness h(R"(
     function OnEvent(e)
         if e == "PROFILE_ACTIVATED" then
@@ -251,7 +242,7 @@ void test_mouse_position_and_compat() {
     CHECK(h.logHas("65535 0 1 2 1"));
 }
 
-void test_restart() {
+TEST(restart) {
     Harness h(R"(function OnEvent(e) OutputLogMessage("%s\n", e) end)");
     Harness::settle();
     h.engine.stop();
@@ -261,32 +252,37 @@ void test_restart() {
     CHECK(h.logHas("second PROFILE_ACTIVATED"));
 }
 
-}  // namespace
-
-int main() {
-    const struct { const char* name; std::function<void()> fn; } tests[] = {
-        {"profile_events_and_log", test_profile_events_and_log},
-        {"side_button_presses_key_combo", test_side_button_presses_key_combo},
-        {"scancodes_are_accepted", test_scancodes_are_accepted},
-        {"primary_button_needs_enable", test_primary_button_needs_enable},
-        {"button_numbering_matches_logitech", test_button_numbering_matches_logitech},
-        {"hold_loop_runs_until_release", test_hold_loop_runs_until_release},
-        {"injected_clicks_are_not_reported_back", test_injected_clicks_are_not_reported_back},
-        {"stop_interrupts_busy_loop_and_releases", test_stop_interrupts_busy_loop_and_releases},
-        {"stop_interrupts_sleep", test_stop_interrupts_sleep},
-        {"keyboard_ignored_when_device_cannot_type", test_keyboard_ignored_when_device_cannot_type},
-        {"modifiers_and_locks", test_modifiers_and_locks},
-        {"sandbox", test_sandbox},
-        {"load_errors", test_load_errors},
-        {"runtime_error_is_logged_and_script_keeps_running", test_runtime_error_is_logged_and_script_keeps_running},
-        {"mouse_position_and_compat", test_mouse_position_and_compat},
-        {"restart", test_restart},
-    };
-    for (const auto& t : tests) {
-        int before = g_failures;
-        t.fn();
-        std::printf("%s %s\n", g_failures == before ? "ok  " : "FAIL", t.name);
-    }
-    std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
-    return g_failures ? 1 : 0;
+TEST(extra_buttons_6_and_up) {
+    Harness h(R"(
+    function OnEvent(event, arg, family)
+        if event == "MOUSE_BUTTON_PRESSED" and arg == 6 then
+            OutputLogMessage("pressed 6 %s held=%s\n", family, tostring(IsMouseButtonPressed(6)))
+        elseif event == "MOUSE_BUTTON_RELEASED" and arg == 6 then
+            OutputLogMessage("released 6 held=%s\n", tostring(IsMouseButtonPressed(6)))
+        end
+    end)");
+    h.engine.onExtraButton(6, true);
+    h.engine.onExtraButton(6, true);  // key auto-repeat must not fire twice
+    Harness::settle();
+    h.engine.onExtraButton(6, false);
+    Harness::settle();
+    const std::string log = h.log();
+    CHECK(log.find("pressed 6 mouse held=true") != std::string::npos);
+    CHECK(log.find("pressed 6", log.find("pressed 6") + 1) == std::string::npos);
+    CHECK(log.find("released 6 held=false") != std::string::npos);
 }
+
+TEST(g_keys) {
+    Harness h(R"(
+    function OnEvent(event, arg, family)
+        if event == "G_PRESSED" or event == "G_RELEASED" then
+            OutputLogMessage("%s %d %s\n", event, arg, family)
+        end
+    end)");
+    h.engine.onGKey(3, true);
+    h.engine.onGKey(3, false);
+    Harness::settle();
+    CHECK(h.logHas("G_PRESSED 3 kb\nG_RELEASED 3 kb"));
+}
+
+}  // namespace

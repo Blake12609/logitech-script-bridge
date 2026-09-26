@@ -44,6 +44,12 @@ public:
 
     // Called by the platform input hook for every real mouse button change.
     void onPhysicalButton(Button b, bool pressed);
+    // Extra buttons (6 and up), e.g. keys F13-F24 standing in for side buttons.
+    void onExtraButton(int number, bool pressed);
+    // Logitech G-keys (G1, G2, ...): OnEvent("G_PRESSED", n, "kb").
+    void onGKey(int number, bool pressed);
+
+    static constexpr int kMaxButton = 32;
 
     std::function<void()> onClearLog;
 
@@ -104,6 +110,7 @@ private:
     std::mutex smu_;  // guards button state + echo lists
     std::array<bool, kButtonCount> physical_{};
     std::array<bool, kButtonCount> synthetic_{};
+    std::array<bool, kMaxButton + 1> extra_{};  // buttons 6..kMaxButton
     std::array<std::deque<std::pair<bool, Clock::time_point>>, kButtonCount> echo_;
     std::set<const KeyInfo*> keysDown_;  // worker thread only
 };
