@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logitech-script-bridge"
+version = "0.1.0"
+description = "Run Logitech G Hub Lua scripts on any mouse through a MAKCU or ESP32-S3"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = ["lupa>=2.0", "pyserial>=3.5", "pynput>=1.7"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+logitech-script-bridge = "logitech_script_bridge.__main__:main"
+
+[tool.setuptools]
+packages = ["logitech_script_bridge"]
