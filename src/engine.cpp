@@ -110,6 +110,7 @@ bool Engine::start(const std::string& source, const std::string& chunkName, std:
     hasDeadline_ = false;
     primaryEvents_ = false;
     warnedKeyboard_ = false;
+    offX_ = offY_ = 0;
     start_ = Clock::now();
     physical_.fill(false);
     synthetic_.fill(false);
@@ -291,6 +292,29 @@ void Engine::sleepMs(double ms) {
     qcv_.wait_until(lock, end, [&] { return abort_.load(); });
 }
 
+void Engine::setJitter(int x, int y, unsigned seed) {
+    jitterX_ = std::max(0, x);
+    jitterY_ = std::max(0, y);
+    rng_.seed(seed);
+}
+
+int Engine::pickJitter(int range) {
+    return range ? std::uniform_int_distribution<int>(-range, range)(rng_) : 0;
+}
+
+// Each move picks a fresh offset and corrects for the previous one, so the
+// error stays within the range instead of adding up over a long stroke.
+void Engine::moveWithJitter(int dx, int dy) {
+    if ((jitterX_ || jitterY_) && (dx || dy)) {
+        const int nx = pickJitter(jitterX_), ny = pickJitter(jitterY_);
+        dx += nx - offX_;
+        dy += ny - offY_;
+        offX_ = nx;
+        offY_ = ny;
+    }
+    out_.move(dx, dy);
+}
+
 Backend* Engine::keyOutput() { return out_.supportsKeyboard() ? &out_ : keyFallback_; }
 
 void Engine::releaseAll() {
@@ -424,7 +448,7 @@ int Engine::l_mpressed(lua_State* L) {
 }
 
 int Engine::l_moveRel(lua_State* L) {
-    self(L)->out_.move(toInt(L, 1), toInt(L, 2));
+    self(L)->moveWithJitter(toInt(L, 1), toInt(L, 2));
     return 0;
 }
 
@@ -438,8 +462,11 @@ int Engine::l_moveTo(lua_State* L) {
     Engine* e = self(L);
     int left, top, w, h;
     e->input_.screenRect(lua_toboolean(L, 3), left, top, w, h);
-    const int tx = left + static_cast<int>(std::lround(luaL_checknumber(L, 1) * (w - 1) / 65535.0));
-    const int ty = top + static_cast<int>(std::lround(luaL_checknumber(L, 2) * (h - 1) / 65535.0));
+    // with randomizing on, aim for a spot near the target; later relative moves wobble around it
+    e->offX_ = e->pickJitter(e->jitterX_);
+    e->offY_ = e->pickJitter(e->jitterY_);
+    const int tx = left + static_cast<int>(std::lround(luaL_checknumber(L, 1) * (w - 1) / 65535.0)) + e->offX_;
+    const int ty = top + static_cast<int>(std::lround(luaL_checknumber(L, 2) * (h - 1) / 65535.0)) + e->offY_;
     for (int i = 0; i < 3; i++) {
         int cx, cy;
         e->input_.cursorPos(cx, cy);

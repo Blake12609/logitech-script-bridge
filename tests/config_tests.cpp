@@ -50,6 +50,8 @@ TEST(config_roundtrip_with_relative_script) {
     c.keyFallback = false;
     c.extraKeys = "gkeys";
     c.autoStart = true;
+    c.jitterX = 3;
+    c.jitterY = 2;
     std::string err;
     const std::string path = joinPath(dir, "game.ini");
     CHECK(saveConfig(path, c, err));
@@ -108,6 +110,7 @@ TEST(config_extras_defaults_and_bad_input) {
     CHECK(c.baud == 115200);
     CHECK(!c.keyFallback);
     CHECK(c.extraKeys == "off");
+    CHECK(c.jitterX == 0 && c.jitterY == 0);
     CHECK(extras["config_file"] == "x.ini");
 
     Config missing;

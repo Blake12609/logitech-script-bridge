@@ -130,7 +130,7 @@ int textWidth(HDC dc, const std::wstring& s, HFONT font) {
 enum Id {
     IDC_START = 100, IDC_STOP, IDC_OPEN, IDC_LOADCFG, IDC_SAVECFG, IDC_SAVEAS, IDC_RELOAD, IDC_EDIT,
     IDC_SCRIPT, IDC_SCRIPT_MENU, IDC_BROWSE, IDC_DEVICE, IDC_PORT, IDC_PORT_MENU, IDC_BAUD, IDC_TEST,
-    IDC_KEYFALLBACK, IDC_EXTRA, IDC_AUTOSTART, IDC_CLEAR, IDC_LOG,
+    IDC_KEYFALLBACK, IDC_EXTRA, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y, IDC_CLEAR, IDC_LOG,
 };
 
 enum class Role { Primary, Danger, Secondary, Dropdown, Chevron, Toggle };
@@ -223,6 +223,8 @@ Config currentConfig() {
     c.keyFallback = app.keyFallback;
     c.extraKeys = kExtraKeys[app.extraKeys];
     c.autoStart = app.autoStart;
+    c.jitterX = std::max(0, _wtoi(getText(IDC_JITTER_X).c_str()));
+    c.jitterY = std::max(0, _wtoi(getText(IDC_JITTER_Y).c_str()));
     return c;
 }
 
@@ -236,6 +238,8 @@ void applyConfig(const Config& c) {
     SetWindowTextW(app.item(IDC_BAUD), std::to_wstring(c.baud).c_str());
     app.keyFallback = c.keyFallback;
     app.autoStart = c.autoStart;
+    SetWindowTextW(app.item(IDC_JITTER_X), std::to_wstring(c.jitterX).c_str());
+    SetWindowTextW(app.item(IDC_JITTER_Y), std::to_wstring(c.jitterY).c_str());
     app.extraKeys = 0;
     for (int i = 0; i < 3; i++)
         if (c.extraKeys == kExtraKeys[i]) app.extraKeys = i;
@@ -263,7 +267,7 @@ void refreshChrome() {
     EnableWindow(app.item(IDC_STOP), run);
     EnableWindow(app.item(IDC_RELOAD), run);
     for (int id : {IDC_SCRIPT, IDC_SCRIPT_MENU, IDC_BROWSE, IDC_OPEN, IDC_LOADCFG, IDC_DEVICE, IDC_EXTRA,
-                   IDC_KEYFALLBACK, IDC_AUTOSTART})
+                   IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y})
         EnableWindow(app.item(id), !run);
     for (int id : {IDC_PORT, IDC_PORT_MENU, IDC_BAUD}) EnableWindow(app.item(id), !run && serial);
     EnableWindow(app.item(IDC_TEST), !run);
@@ -438,6 +442,7 @@ void startScript() {
     app.engine = std::make_unique<Engine>(*app.backend, app.input, [](const std::string& s) { app.log(s); },
                                           app.fallback.get());
     app.engine->onClearLog = [] { PostMessageW(app.wnd, WM_APP_CLEARLOG, 0, 0); };
+    app.engine->setJitter(c.jitterX, c.jitterY);
 
     app.log(std::string("\nStarting ") + fileName(c.script) + " on " + info.label + "\n");
     if (!app.engine->start(source, fileName(c.script), err)) {
@@ -454,6 +459,9 @@ void startScript() {
         errorBox(L"Input", err);
         return;
     }
+    if (c.jitterX || c.jitterY)
+        app.log("Randomizing mouse movement by up to \u00B1" + std::to_string(c.jitterX) + " px X / \u00B1" +
+                std::to_string(c.jitterY) + " px Y.\n");
     if (c.extraKeys == "mouse") app.log("F13–F24 act as mouse buttons 6–17.\n");
     if (c.extraKeys == "gkeys") app.log("F13–F24 act as G-keys G1–G12.\n");
     app.status = App::Status::Running;
@@ -814,7 +822,7 @@ void layout() {
 
     // device + options cards
     y += app.S(88) + app.S(12);
-    const int cardH = app.S(196), half = (W - 2 * m - app.S(12)) / 2;
+    const int cardH = app.S(244), half = (W - 2 * m - app.S(12)) / 2;
     const int lx = m, rx = m + half + app.S(12);
     app.cards.push_back({{lx, y, lx + half, y + cardH}, L"OUTPUT DEVICE"});
     app.cards.push_back({{rx, y, rx + half, y + cardH}, L"OPTIONS"});
@@ -838,6 +846,14 @@ void layout() {
                           L"F13–F24 keys (for mice with extra buttons)"});
     place(IDC_EXTRA, rx + pad, y + app.S(100), inner, fh);
     place(IDC_AUTOSTART, rx + pad, y + app.S(148), inner, app.S(30));
+    // randomize movement: label, then X and Y fields
+    const int jy = y + app.S(192), jw = app.S(64), jl = app.S(18);
+    const int jx = rx + half - pad - 2 * jw - 2 * jl - gap;
+    app.labels.push_back({{rx + pad + app.S(2), jy, jx - gap, jy + fh}, L"Randomize movement (\u00B1 px)"});
+    app.labels.push_back({{jx, jy, jx + jl, jy + fh}, L"X"});
+    field(IDC_JITTER_X, jx + jl, jy, jw);
+    app.labels.push_back({{jx + jl + jw + gap, jy, jx + 2 * jl + jw + gap, jy + fh}, L"Y"});
+    field(IDC_JITTER_Y, jx + 2 * jl + jw + gap, jy, jw);
 
     // log card
     y += cardH + app.S(12);
@@ -952,12 +968,14 @@ void createControls() {
     button(IDC_KEYFALLBACK, L"Type keys in software when the device can't", Role::Toggle);
     button(IDC_EXTRA, L"", Role::Dropdown);
     button(IDC_AUTOSTART, L"Start the script when the app opens", Role::Toggle);
+    make(L"EDIT", L"0", ES_NUMBER | ES_AUTOHSCROLL, IDC_JITTER_X);
+    make(L"EDIT", L"0", ES_NUMBER | ES_AUTOHSCROLL, IDC_JITTER_Y);
     button(IDC_CLEAR, L"Clear", Role::Secondary);
     HWND log = make(L"EDIT", L"", WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG, app.fontMono);
     SendMessageW(log, EM_SETLIMITTEXT, 0, 0);
 
     const int m = app.S(4);
-    for (int id : {IDC_SCRIPT, IDC_PORT, IDC_BAUD}) SendMessageW(app.item(id), EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
+    for (int id : {IDC_SCRIPT, IDC_PORT, IDC_BAUD, IDC_JITTER_X, IDC_JITTER_Y}) SendMessageW(app.item(id), EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
     SendMessageW(log, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(m, m));
     SendMessageW(app.item(IDC_SCRIPT), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Pick a .lua script"));
     SendMessageW(app.item(IDC_PORT), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"e.g. COM5"));
@@ -1014,6 +1032,8 @@ void onCommand(int id, int code) {
         case IDC_SCRIPT:
         case IDC_PORT:
         case IDC_BAUD:
+        case IDC_JITTER_X:
+        case IDC_JITTER_Y:
             if (code == EN_CHANGE) refreshChrome();
             if (code == EN_SETFOCUS || code == EN_KILLFOCUS) InvalidateRect(app.wnd, &app.fields[id], FALSE);
             break;
@@ -1036,7 +1056,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_GETMINMAXINFO: {
             auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-            mm->ptMinTrackSize = {app.S(780), app.S(640)};
+            mm->ptMinTrackSize = {app.S(780), app.S(690)};
             return 0;
         }
         case WM_DRAWITEM:
@@ -1139,7 +1159,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
 
     app.wnd = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Logitech Script Bridge",
                               WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, app.S(860),
-                              app.S(760), nullptr, nullptr, inst, nullptr);
+                              app.S(800), nullptr, nullptr, inst, nullptr);
     createControls();
     enableDarkChrome();
     loadState(arg);

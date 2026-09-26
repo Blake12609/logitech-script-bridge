@@ -83,6 +83,14 @@ The title bar shows `*` when the settings differ from the loaded config.
 
 Turn on **Start the script when the app opens** and the app is ready to go as soon as you launch it.
 
+### Randomize movement
+
+**Randomize movement (± px)** adds a small random offset of up to X pixels sideways and Y pixels
+up/down to every mouse movement the script makes. That gives drawing scripts in Paint and similar
+apps a hand-drawn look. The pointer wobbles around the path the script asked for and never drifts
+further than X / Y away from it, even over long strokes. Set both to 0 (the default) for exact
+movement. Try [`examples/paint_draw_line.lua`](examples/paint_draw_line.lua) with X 3, Y 2.
+
 ### Mice with more than five buttons
 
 G HUB reports buttons 6 and up for Logitech mice with extra buttons. Windows only

@@ -285,4 +285,41 @@ TEST(g_keys) {
     CHECK(h.logHas("G_PRESSED 3 kb\nG_RELEASED 3 kb"));
 }
 
+TEST(jitter_wobbles_around_the_path) {
+    DryRunBackend backend;
+    NullInput input;
+    Engine engine(backend, input, [](const std::string&) {});
+    engine.setJitter(3, 2, 1234);
+    std::string err;
+    CHECK(engine.start(R"(
+    function OnEvent(e)
+        if e == "PROFILE_ACTIVATED" then
+            for i = 1, 500 do MoveMouseRelative(1, 0) end
+        end
+    end)", "jitter.lua", err));
+    Harness::settle(200);
+    engine.stop();
+    int x = 0, y = 0, steps = 0;
+    bool varied = false, inRange = true;
+    for (const auto& line : backend.sent()) {
+        int dx = 0, dy = 0;
+        if (std::sscanf(line.c_str(), "move %d %d", &dx, &dy) != 2) continue;
+        x += dx;
+        y += dy;
+        steps++;
+        if (dx != 1 || dy != 0) varied = true;
+        // never further than the range from where the script thinks the pointer is
+        if (x < steps - 3 || x > steps + 3 || y < -2 || y > 2) inRange = false;
+    }
+    CHECK(steps == 500);  // the dry-run device records (0,0) moves too
+    CHECK(varied);
+    CHECK(inRange);
+}
+
+TEST(jitter_off_is_exact) {
+    Harness h(R"(function OnEvent(e) if e == "PROFILE_ACTIVATED" then MoveMouseRelative(5, -4) MoveMouseRelative(-2, 7) end end)");
+    Harness::settle();
+    CHECK((h.backend.sent() == Sent{"move 5 -4", "move -2 7"}));
+}
+
 }  // namespace

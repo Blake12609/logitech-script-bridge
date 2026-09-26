@@ -12,6 +12,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <random>
 #include <set>
 #include <string>
 #include <thread>
@@ -51,6 +52,11 @@ public:
 
     static constexpr int kMaxButton = 32;
 
+    // Randomize every mouse movement the script makes by up to +-x / +-y counts
+    // (0 = off), e.g. for a hand-drawn look. The pointer wobbles around the path
+    // the script asked for instead of drifting away from it. Call before start().
+    void setJitter(int x, int y, unsigned seed = std::random_device{}());
+
     std::function<void()> onClearLog;
 
 private:
@@ -69,6 +75,8 @@ private:
     bool shouldAbort();
     void sleepMs(double ms);
     Backend* keyOutput();
+    void moveWithJitter(int dx, int dy);
+    int pickJitter(int range);
 
     // Lua API (C functions)
     static Engine* self(lua_State* L);
@@ -102,6 +110,10 @@ private:
     Clock::time_point deadline_;
     Clock::time_point start_;
     bool warnedKeyboard_ = false;
+
+    int jitterX_ = 0, jitterY_ = 0;  // configured range
+    int offX_ = 0, offY_ = 0;        // current random offset from the exact path (worker thread only)
+    std::mt19937 rng_;
 
     std::mutex qmu_;
     std::condition_variable qcv_;

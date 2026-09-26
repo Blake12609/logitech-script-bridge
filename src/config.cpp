@@ -1,5 +1,6 @@
 #include "config.h"
 
+#include <algorithm>
 #include <cctype>
 #include <vector>
 #include <cstdlib>
@@ -41,7 +42,8 @@ bool samePathChar(char a, char b) {
 
 bool Config::operator==(const Config& o) const {
     return script == o.script && device == o.device && port == o.port && baud == o.baud &&
-           keyFallback == o.keyFallback && extraKeys == o.extraKeys && autoStart == o.autoStart;
+           keyFallback == o.keyFallback && extraKeys == o.extraKeys && autoStart == o.autoStart &&
+           jitterX == o.jitterX && jitterY == o.jitterY;
 }
 
 FILE* openUtf8(const std::string& path, const char* mode) {
@@ -162,9 +164,11 @@ bool saveConfig(const std::string& path, const Config& c, std::string& error, co
                  "baud=%d\r\n"
                  "key_fallback=%d\r\n"
                  "extra_keys=%s\r\n"
-                 "auto_start=%d\r\n",
+                 "auto_start=%d\r\n"
+                 "jitter_x=%d\r\n"
+                 "jitter_y=%d\r\n",
                  script.c_str(), c.device.c_str(), c.port.c_str(), c.baud, c.keyFallback ? 1 : 0,
-                 c.extraKeys.c_str(), c.autoStart ? 1 : 0);
+                 c.extraKeys.c_str(), c.autoStart ? 1 : 0, c.jitterX, c.jitterY);
     if (extras)
         for (const auto& kv : *extras) std::fprintf(f, "%s=%s\r\n", kv.first.c_str(), kv.second.c_str());
     const bool ok = std::fclose(f) == 0;
@@ -203,6 +207,8 @@ bool loadConfig(const std::string& path, Config& c, std::string& error, ConfigEx
         else if (key == "key_fallback") out.keyFallback = parseBool(value);
         else if (key == "extra_keys") out.extraKeys = value;
         else if (key == "auto_start") out.autoStart = parseBool(value);
+        else if (key == "jitter_x") out.jitterX = std::max(0, std::atoi(value.c_str()));
+        else if (key == "jitter_y") out.jitterY = std::max(0, std::atoi(value.c_str()));
         else if (extras) (*extras)[key] = value;
     }
     c = out;
