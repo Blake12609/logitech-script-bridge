@@ -15,6 +15,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 if(MSVC)
   add_compile_options(/utf-8)  # sources are UTF-8
 endif()
+if(WIN32)
+  add_compile_definitions(NOMINMAX)  # keep windows.h from defining min/max macros
+endif()
 if(MINGW)
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
