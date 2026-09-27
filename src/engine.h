@@ -57,6 +57,9 @@ public:
     // the script asked for instead of drifting away from it. Call before start().
     void setJitter(int x, int y, unsigned seed = std::random_device{}());
 
+    // Button n (OnEvent numbering 1-5): held on the real mouse / held by the script.
+    void buttonState(int n, bool& physical, bool& script);
+
     std::function<void()> onClearLog;
 
 private:

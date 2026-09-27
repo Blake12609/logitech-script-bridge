@@ -52,6 +52,7 @@ TEST(config_roundtrip_with_relative_script) {
     c.autoStart = true;
     c.jitterX = 3;
     c.jitterY = 2;
+    c.hotkey = "f8";
     std::string err;
     const std::string path = joinPath(dir, "game.ini");
     CHECK(saveConfig(path, c, err));
@@ -110,7 +111,7 @@ TEST(config_extras_defaults_and_bad_input) {
     CHECK(c.baud == 115200);
     CHECK(!c.keyFallback);
     CHECK(c.extraKeys == "off");
-    CHECK(c.jitterX == 0 && c.jitterY == 0);
+    CHECK(c.jitterX == 0 && c.jitterY == 0 && c.hotkey == "off");
     CHECK(extras["config_file"] == "x.ini");
 
     Config missing;

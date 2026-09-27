@@ -180,6 +180,14 @@ void Engine::onExtraButton(int number, bool pressed) {
     if (running_) post({pressed ? "MOUSE_BUTTON_PRESSED" : "MOUSE_BUTTON_RELEASED", number, "mouse"});
 }
 
+void Engine::buttonState(int n, bool& physical, bool& script) {
+    physical = script = false;
+    if (n < 1 || n > kButtonCount) return;
+    std::lock_guard<std::mutex> lock(smu_);
+    physical = physical_[n - 1];  // Button order matches OnEvent numbering
+    script = synthetic_[n - 1];
+}
+
 void Engine::onGKey(int number, bool pressed) {
     if (running_) post({pressed ? "G_PRESSED" : "G_RELEASED", number, "kb"});
 }

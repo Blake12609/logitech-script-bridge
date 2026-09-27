@@ -322,4 +322,20 @@ TEST(jitter_off_is_exact) {
     CHECK((h.backend.sent() == Sent{"move 5 -4", "move -2 7"}));
 }
 
+TEST(button_state_for_indicator) {
+    Harness h(R"(
+    function OnEvent(e, a)
+        if e == "MOUSE_BUTTON_PRESSED" and a == 4 then PressMouseButton(3) end
+    end)");
+    h.engine.onPhysicalButton(Button::Side1, true);
+    Harness::settle();
+    bool phys = false, script = false;
+    h.engine.buttonState(4, phys, script);
+    CHECK(phys && !script);
+    h.engine.buttonState(2, phys, script);  // PressMouseButton(3) is the right button = OnEvent 2
+    CHECK(!phys && script);
+    h.engine.buttonState(9, phys, script);
+    CHECK(!phys && !script);
+}
+
 }  // namespace

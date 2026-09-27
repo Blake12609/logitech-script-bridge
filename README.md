@@ -71,7 +71,10 @@ protocol should work with the MAKCU or KMBox setting.
    the window, or keep your scripts in a `scripts\` folder next to the exe and pick them from the ⌄ menu.
 3. **Output device**: pick your hardware and its COM port (the ⌄ menu lists connected ports).
    Press **Test**: the mouse pointer should wiggle right and back.
-4. Press **Start** (F5). Script output (`OutputLogMessage`) appears in the log.
+4. Press **Start** (F5). Script output (`OutputLogMessage`) appears in the log in white, app
+   messages in grey and errors in red. Hover over any button to see its keyboard shortcut.
+
+The window remembers its size and position.
 
 ### Save and load configs
 
@@ -82,6 +85,17 @@ saved as relative paths, so you can move the whole folder or carry it on a USB s
 The title bar shows `*` when the settings differ from the loaded config.
 
 Turn on **Start the script when the app opens** and the app is ready to go as soon as you launch it.
+
+### Start/stop hotkey
+
+Pick a **Start/stop hotkey** (F6–F12, Pause or Scroll Lock) to start and stop the script from
+anywhere, even while a game or Paint is in front. While it's set, that key is reserved for the app.
+
+### Live button indicator
+
+The **Mouse buttons** row lights up as you press buttons while a script runs: filled means pressed on
+your mouse, outlined means held by the script. It's also a quick way to see which number
+(`OnEvent` arg) each button has.
 
 ### Randomize movement
 

@@ -19,6 +19,7 @@ struct Config {
     std::string extraKeys = "off";  // F13-F24: "off", "mouse" (buttons 6-17) or "gkeys" (G1-G12)
     bool autoStart = false;       // start the script when the app opens
     int jitterX = 0, jitterY = 0; // randomize script mouse movement by up to +- this many pixels
+    std::string hotkey = "off";   // global start/stop key: "off", "f6".."f12", "pause", "scrolllock"
 
     bool operator==(const Config& o) const;
     bool operator!=(const Config& o) const { return !(*this == o); }

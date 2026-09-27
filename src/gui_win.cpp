@@ -10,10 +10,13 @@
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <mmsystem.h>
+#include <richedit.h>
 #include <shellapi.h>
 #include <uxtheme.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <objidl.h>  // GDI+ needs COM declarations that WIN32_LEAN_AND_MEAN leaves out
 namespace Gdiplus {
 using std::max;
@@ -130,7 +133,7 @@ int textWidth(HDC dc, const std::wstring& s, HFONT font) {
 enum Id {
     IDC_START = 100, IDC_STOP, IDC_OPEN, IDC_LOADCFG, IDC_SAVECFG, IDC_SAVEAS, IDC_RELOAD, IDC_EDIT,
     IDC_SCRIPT, IDC_SCRIPT_MENU, IDC_BROWSE, IDC_DEVICE, IDC_PORT, IDC_PORT_MENU, IDC_BAUD, IDC_TEST,
-    IDC_KEYFALLBACK, IDC_EXTRA, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y, IDC_CLEAR, IDC_LOG,
+    IDC_KEYFALLBACK, IDC_EXTRA, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y, IDC_HOTKEY, IDC_CLEAR, IDC_LOG,
 };
 
 enum class Role { Primary, Danger, Secondary, Dropdown, Chevron, Toggle };
@@ -139,8 +142,27 @@ const UINT WM_APP_CLEARLOG = WM_APP + 1;
 const UINT_PTR kLogTimer = 1;
 
 const char* const kExtraKeys[] = {"off", "mouse", "gkeys"};
-const wchar_t* const kExtraLabels[] = {L"Off (F13–F24 stay normal keys)", L"Extra mouse buttons 6–17",
-                                       L"G-keys G1–G12"};
+const wchar_t* const kExtraLabels[] = {L"Off", L"Mouse buttons 6–17", L"G-keys G1–G12"};
+
+// global start/stop key
+const struct { const char* key; const wchar_t* label; UINT vk; } kHotkeys[] = {
+    {"off", L"Off", 0},        {"f6", L"F6", VK_F6},   {"f7", L"F7", VK_F7},        {"f8", L"F8", VK_F8},
+    {"f9", L"F9", VK_F9},      {"f10", L"F10", VK_F10}, {"f11", L"F11", VK_F11},    {"f12", L"F12", VK_F12},
+    {"pause", L"Pause", VK_PAUSE}, {"scrolllock", L"Scroll Lock", VK_SCROLL},
+};
+const int kHotkeyCount = sizeof(kHotkeys) / sizeof(kHotkeys[0]);
+const int kHotkeyId = 1;
+
+// log line colours
+enum class LogKind { Script, Info, Error, Dry };
+COLORREF logColor(LogKind k) {
+    switch (k) {
+        case LogKind::Info: return RGB(0x8d, 0x93, 0x9e);
+        case LogKind::Error: return RGB(0xff, 0x7b, 0x72);
+        case LogKind::Dry: return RGB(0x79, 0xa8, 0xff);
+        default: return RGB(0xe8, 0xea, 0xed);
+    }
+}
 
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
@@ -176,7 +198,9 @@ struct App {
 
     std::string exeDir, statePath, configPath;
     Config savedConfig;  // contents of configPath, to show "unsaved changes"
-    int device = 0, extraKeys = 0;
+    int device = 0, extraKeys = 0, hotkey = 0;
+    bool hotkeyRegistered = false;
+    unsigned lastButtons = ~0u;  // indicator state last painted
     bool keyFallback = true, autoStart = false;
     enum class Status { Stopped, Running, Error } status = Status::Stopped;
 
@@ -185,22 +209,23 @@ struct App {
     std::unique_ptr<Engine> engine;
 
     std::mutex logMu;
-    std::string pendingLog;
+    std::vector<std::pair<LogKind, std::string>> pendingLog;
 
     std::map<int, Role> roles;
     std::map<int, RECT> fields;  // painted field boxes around edits (by edit id)
     std::vector<Card> cards;
     std::vector<Label> labels;
-    RECT header{}, hintRect{}, pillRect{};
-    HWND hover = nullptr;
+    RECT header{}, hintRect{}, pillRect{}, buttonsRect{};
+    HWND hover = nullptr, tooltip = nullptr;
     HACCEL accel = nullptr;
 
     HWND item(int id) const { return GetDlgItem(wnd, id); }
     int S(int v) const { return MulDiv(v, dpi, 96); }
     bool running() const { return engine != nullptr; }
-    void log(const std::string& s) {
+    void log(const std::string& s, LogKind kind = LogKind::Info) {
         std::lock_guard<std::mutex> lock(logMu);
-        pendingLog += s;
+        if (!pendingLog.empty() && pendingLog.back().first == kind) pendingLog.back().second += s;
+        else pendingLog.emplace_back(kind, s);
     }
 } app;
 
@@ -225,10 +250,24 @@ Config currentConfig() {
     c.autoStart = app.autoStart;
     c.jitterX = std::max(0, _wtoi(getText(IDC_JITTER_X).c_str()));
     c.jitterY = std::max(0, _wtoi(getText(IDC_JITTER_Y).c_str()));
+    c.hotkey = kHotkeys[app.hotkey].key;
     return c;
 }
 
 void refreshChrome();
+
+void registerHotkey() {
+    if (app.hotkeyRegistered) UnregisterHotKey(app.wnd, kHotkeyId);
+    app.hotkeyRegistered = false;
+    const UINT vk = kHotkeys[app.hotkey].vk;
+    if (!vk) return;
+    app.hotkeyRegistered = RegisterHotKey(app.wnd, kHotkeyId, MOD_NOREPEAT, vk) != 0;
+    if (app.hotkeyRegistered)
+        app.log("Press " + narrow(kHotkeys[app.hotkey].label) + " anywhere to start or stop the script.\n");
+    else
+        app.log(narrow(kHotkeys[app.hotkey].label) + " is already used by another program; pick another hotkey.\n",
+                LogKind::Error);
+}
 
 void applyConfig(const Config& c) {
     SetWindowTextW(app.item(IDC_SCRIPT), widen(c.script).c_str());
@@ -243,13 +282,24 @@ void applyConfig(const Config& c) {
     app.extraKeys = 0;
     for (int i = 0; i < 3; i++)
         if (c.extraKeys == kExtraKeys[i]) app.extraKeys = i;
-    for (int id : {IDC_DEVICE, IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_EXTRA}) InvalidateRect(app.item(id), nullptr, TRUE);
+    app.hotkey = 0;
+    for (int i = 0; i < kHotkeyCount; i++)
+        if (c.hotkey == kHotkeys[i].key) app.hotkey = i;
+    registerHotkey();
+    for (int id : {IDC_DEVICE, IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_EXTRA, IDC_HOTKEY})
+        InvalidateRect(app.item(id), nullptr, TRUE);
     refreshChrome();
 }
 
 void saveState() {
     ConfigExtras extras;
     if (!app.configPath.empty()) extras["config_file"] = makeRelative(app.configPath, app.exeDir);
+    WINDOWPLACEMENT wp = {sizeof(wp)};
+    if (GetWindowPlacement(app.wnd, &wp)) {
+        const RECT& r = wp.rcNormalPosition;
+        extras["window"] = std::to_string(r.left) + "," + std::to_string(r.top) + "," + std::to_string(r.right - r.left) +
+                           "," + std::to_string(r.bottom - r.top) + (wp.showCmd == SW_SHOWMAXIMIZED ? ",max" : "");
+    }
     std::string err;
     saveConfig(app.statePath, currentConfig(), err, &extras);
 }
@@ -267,7 +317,7 @@ void refreshChrome() {
     EnableWindow(app.item(IDC_STOP), run);
     EnableWindow(app.item(IDC_RELOAD), run);
     for (int id : {IDC_SCRIPT, IDC_SCRIPT_MENU, IDC_BROWSE, IDC_OPEN, IDC_LOADCFG, IDC_DEVICE, IDC_EXTRA,
-                   IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y})
+                   IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y, IDC_HOTKEY})
         EnableWindow(app.item(id), !run);
     for (int id : {IDC_PORT, IDC_PORT_MENU, IDC_BAUD}) EnableWindow(app.item(id), !run && serial);
     EnableWindow(app.item(IDC_TEST), !run);
@@ -280,26 +330,43 @@ void refreshChrome() {
 // ------------------------------------------------------------------ log
 
 void flushLog() {
-    std::string chunk;
+    std::vector<std::pair<LogKind, std::string>> chunks;
     {
         std::lock_guard<std::mutex> lock(app.logMu);
-        chunk.swap(app.pendingLog);
+        chunks.swap(app.pendingLog);
     }
-    if (chunk.empty()) return;
-    std::string crlf;
-    for (size_t i = 0; i < chunk.size(); i++) {
-        if (chunk[i] == '\n' && (i == 0 || chunk[i - 1] != '\r')) crlf += '\r';
-        crlf += chunk[i];
-    }
+    if (chunks.empty()) return;
     HWND box = app.item(IDC_LOG);
-    int len = GetWindowTextLengthW(box);
-    if (len > 400000) {  // keep the log from growing forever
-        SendMessageW(box, EM_SETSEL, 0, len / 2);
+    if (GetWindowTextLengthW(box) > 400000) {  // keep the log from growing forever
+        CHARRANGE head = {0, GetWindowTextLengthW(box) / 2};
+        SendMessageW(box, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&head));
         SendMessageW(box, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
-        len = GetWindowTextLengthW(box);
     }
-    SendMessageW(box, EM_SETSEL, len, len);
-    SendMessageW(box, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(widen(crlf).c_str()));
+    for (const auto& chunk : chunks) {
+        std::string crlf;
+        for (size_t i = 0; i < chunk.second.size(); i++) {
+            if (chunk.second[i] == '\n' && (i == 0 || chunk.second[i - 1] != '\r')) crlf += '\r';
+            crlf += chunk.second[i];
+        }
+        CHARRANGE end = {-1, -1};
+        SendMessageW(box, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&end));
+        CHARFORMAT2W cf = {};
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR;
+        cf.crTextColor = logColor(chunk.first);
+        SendMessageW(box, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&cf));
+        SendMessageW(box, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(widen(crlf).c_str()));
+    }
+    SendMessageW(box, WM_VSCROLL, SB_BOTTOM, 0);
+}
+
+// Engine messages share the script's log callback; tell them apart by their wording.
+LogKind engineLogKind(const std::string& s) {
+    if (s.rfind("Script error", 0) == 0 || s.rfind("Unknown ", 0) == 0) return LogKind::Error;
+    if (s.rfind("Script loaded", 0) == 0 || s.rfind("Script stopped", 0) == 0 || s.rfind("This device", 0) == 0 ||
+        s.rfind("PlayMacro", 0) == 0)
+        return LogKind::Info;
+    return LogKind::Script;
 }
 
 void clearLog() {
@@ -307,7 +374,7 @@ void clearLog() {
     SetWindowTextW(app.item(IDC_LOG), L"");
 }
 
-void dryRunLog(void*, const std::string& s) { app.log(s); }
+void dryRunLog(void*, const std::string& s) { app.log(s, LogKind::Dry); }
 
 // ------------------------------------------------------------------ dialogs & menus
 
@@ -439,7 +506,7 @@ void startScript() {
     }
     if (!app.backend->supportsKeyboard() && c.keyFallback) app.fallback = createSoftwareBackend();
 
-    app.engine = std::make_unique<Engine>(*app.backend, app.input, [](const std::string& s) { app.log(s); },
+    app.engine = std::make_unique<Engine>(*app.backend, app.input, [](const std::string& s) { app.log(s, engineLogKind(s)); },
                                           app.fallback.get());
     app.engine->onClearLog = [] { PostMessageW(app.wnd, WM_APP_CLEARLOG, 0, 0); };
     app.engine->setJitter(c.jitterX, c.jitterY);
@@ -448,7 +515,7 @@ void startScript() {
     if (!app.engine->start(source, fileName(c.script), err)) {
         app.engine.reset();
         closeDevices();
-        app.log("Could not load script:\n" + err + "\n");
+        app.log("Could not load script:\n" + err + "\n", LogKind::Error);
         app.status = App::Status::Error;
         flushLog();
         refreshChrome();
@@ -610,6 +677,17 @@ void deviceMenu() {
     refreshChrome();
 }
 
+void hotkeyMenu() {
+    std::vector<std::wstring> items;
+    for (const auto& h : kHotkeys) items.push_back(h.label);
+    const int i = popupMenu(clientRectOf(IDC_HOTKEY), items, app.hotkey);
+    if (i < 0) return;
+    app.hotkey = i;
+    registerHotkey();
+    InvalidateRect(app.item(IDC_HOTKEY), nullptr, TRUE);
+    refreshChrome();
+}
+
 void extraMenu() {
     const int i = popupMenu(clientRectOf(IDC_EXTRA), {kExtraLabels[0], kExtraLabels[1], kExtraLabels[2]}, app.extraKeys);
     if (i < 0) return;
@@ -682,7 +760,9 @@ void drawButton(const DRAWITEMSTRUCT* di) {
         case Role::Dropdown: {
             roundRect(mem, rc, radius, hover ? Color::fieldHover : Color::field,
                       focus ? Color::accent : hover ? Color::borderHover : Color::border);
-            std::wstring value = id == IDC_DEVICE ? widen(kDevices[app.device].label) : kExtraLabels[app.extraKeys];
+            std::wstring value = id == IDC_DEVICE   ? widen(kDevices[app.device].label)
+                                 : id == IDC_HOTKEY ? std::wstring(kHotkeys[app.hotkey].label)
+                                                    : std::wstring(kExtraLabels[app.extraKeys]);
             RECT tr = {app.S(12), 0, w - app.S(34), h};
             text(mem, value, tr, app.font, disabled ? Color::muted : Color::text);
             chevron(mem, w - app.S(18), h / 2, app.S(10), app.dpi / 96.0f * 1.6f, Color::muted);
@@ -773,6 +853,22 @@ void paintWindow(HDC target) {
     // device hint
     text(dc, widen(kDevices[app.device].hint), app.hintRect, app.fontSmall, Color::muted);
 
+    // live mouse buttons: filled = pressed on the mouse, outlined = held by the script
+    const wchar_t* names[] = {L"1  Left", L"2  Right", L"3  Middle", L"4  Back", L"5  Fwd"};
+    const int pillGap = app.S(6), count = 5;
+    const int pillW = (app.buttonsRect.right - app.buttonsRect.left - pillGap * (count - 1)) / count;
+    for (int i = 0; i < count; i++) {
+        bool phys = false, script = false;
+        if (app.engine) app.engine->buttonState(i + 1, phys, script);
+        RECT pr = {app.buttonsRect.left + i * (pillW + pillGap), app.buttonsRect.top,
+                   app.buttonsRect.left + i * (pillW + pillGap) + pillW, app.buttonsRect.bottom};
+        const COLORREF fill = phys ? Color::accent : Color::field;
+        const COLORREF line = script ? Color::accentHover : phys ? Color::accent : Color::border;
+        roundRect(dc, pr, app.S(6), fill, line, script ? app.S(2) : 1);
+        const COLORREF fg = phys ? Color::white : script ? Color::accentHover : app.engine ? Color::text : Color::muted;
+        text(dc, names[i], pr, app.fontSmall, fg, DT_CENTER | DT_VCENTER);
+    }
+
     BitBlt(target, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, old);
     DeleteObject(bmp);
@@ -822,7 +918,7 @@ void layout() {
 
     // device + options cards
     y += app.S(88) + app.S(12);
-    const int cardH = app.S(244), half = (W - 2 * m - app.S(12)) / 2;
+    const int cardH = app.S(272), half = (W - 2 * m - app.S(12)) / 2;
     const int lx = m, rx = m + half + app.S(12);
     app.cards.push_back({{lx, y, lx + half, y + cardH}, L"OUTPUT DEVICE"});
     app.cards.push_back({{rx, y, rx + half, y + cardH}, L"OPTIONS"});
@@ -840,20 +936,25 @@ void layout() {
     place(IDC_PORT_MENU, pf.right - app.S(36), pf.top + app.S(3), app.S(33), fh - app.S(6));
     field(IDC_BAUD, pf.right + gap, pf.top, baudW);
     place(IDC_TEST, pf.right + gap + baudW + gap, pf.top, testW, fh);
+    app.labels.push_back({{lx + pad + app.S(2), y + app.S(176), lx + half - pad, y + app.S(194)},
+                          L"Mouse buttons (live while a script runs)"});
+    app.buttonsRect = {lx + pad, y + app.S(200), lx + half - pad, y + app.S(232)};
 
-    place(IDC_KEYFALLBACK, rx + pad, y + app.S(38), inner, app.S(30));
-    app.labels.push_back({{rx + pad + app.S(2), y + app.S(78), rx + half - pad, y + app.S(96)},
-                          L"F13–F24 keys (for mice with extra buttons)"});
-    place(IDC_EXTRA, rx + pad, y + app.S(100), inner, fh);
-    place(IDC_AUTOSTART, rx + pad, y + app.S(148), inner, app.S(30));
-    // randomize movement: label, then X and Y fields
-    const int jy = y + app.S(192), jw = app.S(64), jl = app.S(18);
-    const int jx = rx + half - pad - 2 * jw - 2 * jl - gap;
-    app.labels.push_back({{rx + pad + app.S(2), jy, jx - gap, jy + fh}, L"Randomize movement (\u00B1 px)"});
-    app.labels.push_back({{jx, jy, jx + jl, jy + fh}, L"X"});
-    field(IDC_JITTER_X, jx + jl, jy, jw);
-    app.labels.push_back({{jx + jl + jw + gap, jy, jx + 2 * jl + jw + gap, jy + fh}, L"Y"});
-    field(IDC_JITTER_Y, jx + 2 * jl + jw + gap, jy, jw);
+    // options: one setting per row, label on the left, control on the right
+    const int labelW = app.S(150), cx = rx + pad + labelW, cw = inner - labelW;
+    auto row = [&](int i) { return y + app.S(36) + i * app.S(46); };
+    place(IDC_KEYFALLBACK, rx + pad, row(0) + app.S(3), inner, app.S(30));
+    place(IDC_AUTOSTART, rx + pad, row(1) + app.S(3), inner, app.S(30));
+    app.labels.push_back({{rx + pad + app.S(2), row(2), cx - gap, row(2) + fh}, L"F13–F24 keys"});
+    place(IDC_EXTRA, cx, row(2), cw, fh);
+    app.labels.push_back({{rx + pad + app.S(2), row(3), cx - gap, row(3) + fh}, L"Start/stop hotkey"});
+    place(IDC_HOTKEY, cx, row(3), cw, fh);
+    const int jw = (cw - 2 * app.S(18) - gap) / 2, jl = app.S(18);
+    app.labels.push_back({{rx + pad + app.S(2), row(4), cx - gap, row(4) + fh}, L"Randomize (\u00B1 px)"});
+    app.labels.push_back({{cx, row(4), cx + jl, row(4) + fh}, L"X"});
+    field(IDC_JITTER_X, cx + jl, row(4), jw);
+    app.labels.push_back({{cx + jl + jw + gap, row(4), cx + 2 * jl + jw + gap, row(4) + fh}, L"Y"});
+    field(IDC_JITTER_Y, cx + 2 * jl + jw + gap, row(4), jw);
 
     // log card
     y += cardH + app.S(12);
@@ -862,7 +963,8 @@ void layout() {
     app.fields[IDC_LOG] = {m + pad, y + app.S(42), W - m - pad, H - m - pad};
     place(IDC_LOG, m + pad + app.S(10), y + app.S(50), W - 2 * m - 2 * pad - app.S(14), H - m - pad - y - app.S(56));
 
-    InvalidateRect(app.wnd, nullptr, FALSE);
+    // controls were moved without repainting; redraw them all at their new size
+    RedrawWindow(app.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
 // ------------------------------------------------------------------ window setup
@@ -970,15 +1072,59 @@ void createControls() {
     button(IDC_AUTOSTART, L"Start the script when the app opens", Role::Toggle);
     make(L"EDIT", L"0", ES_NUMBER | ES_AUTOHSCROLL, IDC_JITTER_X);
     make(L"EDIT", L"0", ES_NUMBER | ES_AUTOHSCROLL, IDC_JITTER_Y);
+    button(IDC_HOTKEY, L"", Role::Dropdown);
     button(IDC_CLEAR, L"Clear", Role::Secondary);
-    HWND log = make(L"EDIT", L"", WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG, app.fontMono);
-    SendMessageW(log, EM_SETLIMITTEXT, 0, 0);
+
+    // colour-coded log (rich edit)
+    LoadLibraryW(L"Msftedit.dll");
+    HWND log = make(MSFTEDIT_CLASS, L"", WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG, app.fontMono);
+    SendMessageW(log, EM_EXLIMITTEXT, 0, 8 * 1024 * 1024);
+    SendMessageW(log, EM_SETBKGNDCOLOR, 0, Color::logBg);
+    CHARFORMAT2W cf = {};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_CHARSET;
+    cf.crTextColor = logColor(LogKind::Script);
+    cf.yHeight = 13 * 72 * 20 / 96;  // 13 px in twips
+    cf.bCharSet = DEFAULT_CHARSET;
+    lstrcpynW(cf.szFaceName, fontExists(L"Cascadia Mono") ? L"Cascadia Mono" : L"Consolas", LF_FACESIZE);
+    SendMessageW(log, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
 
     const int m = app.S(4);
     for (int id : {IDC_SCRIPT, IDC_PORT, IDC_BAUD, IDC_JITTER_X, IDC_JITTER_Y}) SendMessageW(app.item(id), EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
     SendMessageW(log, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(m, m));
     SendMessageW(app.item(IDC_SCRIPT), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Pick a .lua script"));
     SendMessageW(app.item(IDC_PORT), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"e.g. COM5"));
+
+    // tooltips with the keyboard shortcuts
+    app.tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                  0, 0, 0, 0, app.wnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetWindowTheme(app.tooltip, L"DarkMode_Explorer", nullptr);
+    SendMessageW(app.tooltip, TTM_SETMAXTIPWIDTH, 0, app.S(360));
+    const struct { int id; const wchar_t* tip; } tips[] = {
+        {IDC_START, L"Start the script (F5)"},
+        {IDC_STOP, L"Stop the script (Shift+F5)"},
+        {IDC_OPEN, L"Open a .lua script (Ctrl+O)"},
+        {IDC_LOADCFG, L"Load a saved config (Ctrl+L)"},
+        {IDC_SAVECFG, L"Save the settings to the current config (Ctrl+S)"},
+        {IDC_SAVEAS, L"Save the settings as a new config (Ctrl+Shift+S)"},
+        {IDC_EDIT, L"Open the script in your text editor (Ctrl+E)"},
+        {IDC_RELOAD, L"Restart the script after editing it (Ctrl+R)"},
+        {IDC_SCRIPT_MENU, L"Scripts in the scripts\\ and examples\\ folders next to the app"},
+        {IDC_PORT_MENU, L"Serial ports that are plugged in right now"},
+        {IDC_TEST, L"Wiggle the pointer through the device to check that it works"},
+        {IDC_HOTKEY, L"Starts and stops the script from anywhere, even while another app is in front"},
+        {IDC_EXTRA, L"Bind your mouse's extra buttons to F13–F24 in its own software, then pick what they do here"},
+        {IDC_CLEAR, L"Clear the log"},
+    };
+    for (const auto& t : tips) {
+        TTTOOLINFOW ti = {};
+        ti.cbSize = sizeof(ti);
+        ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        ti.hwnd = app.wnd;
+        ti.uId = reinterpret_cast<UINT_PTR>(app.item(t.id));
+        ti.lpszText = const_cast<wchar_t*>(t.tip);
+        SendMessageW(app.tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+    }
 
     ACCEL keys[] = {
         {FCONTROL | FVIRTKEY, 'O', IDC_OPEN},       {FCONTROL | FVIRTKEY, 'L', IDC_LOADCFG},
@@ -1017,6 +1163,7 @@ void onCommand(int id, int code) {
         case IDC_PORT_MENU: portMenu(); break;
         case IDC_DEVICE: deviceMenu(); break;
         case IDC_EXTRA: extraMenu(); break;
+        case IDC_HOTKEY: hotkeyMenu(); break;
         case IDC_TEST: testDevice(); break;
         case IDC_CLEAR: clearLog(); break;
         case IDC_KEYFALLBACK:
@@ -1056,7 +1203,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_GETMINMAXINFO: {
             auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-            mm->ptMinTrackSize = {app.S(780), app.S(690)};
+            mm->ptMinTrackSize = {app.S(780), app.S(700)};
             return 0;
         }
         case WM_DRAWITEM:
@@ -1083,8 +1230,25 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DragFinish(reinterpret_cast<HDROP>(wp));
             return 0;
         }
-        case WM_TIMER:
+        case WM_TIMER: {
             flushLog();
+            unsigned bits = app.engine ? 0u : 0x400u;  // repaint the indicator only when it changes
+            for (int i = 0; i < 5 && app.engine; i++) {
+                bool phys, script;
+                app.engine->buttonState(i + 1, phys, script);
+                bits |= (phys ? 1u : 0u) << i | (script ? 1u : 0u) << (i + 5);
+            }
+            if (bits != app.lastButtons) {
+                app.lastButtons = bits;
+                InvalidateRect(hwnd, &app.buttonsRect, FALSE);
+            }
+            return 0;
+        }
+        case WM_HOTKEY:
+            if (wp == kHotkeyId) {
+                if (app.running()) stopScript();
+                else startScript();
+            }
             return 0;
         case WM_APP_CLEARLOG:
             clearLog();
@@ -1111,11 +1275,31 @@ void initPaths() {
     app.statePath = joinPath(app.exeDir, (dot == std::string::npos ? base : base.substr(0, dot)) + ".ini");
 }
 
+std::string savedWindow;
+
+// Puts the window back where it was last time, if that spot is still on a screen.
+void restoreWindow(int show) {
+    int x, y, w, h;
+    char max[4] = "";
+    if (std::sscanf(savedWindow.c_str(), "%d,%d,%d,%d,%3s", &x, &y, &w, &h, max) >= 4 && w > 0 && h > 0) {
+        RECT r = {x, y, x + w, y + h};
+        if (MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) {
+            WINDOWPLACEMENT wp = {sizeof(wp)};
+            wp.rcNormalPosition = r;
+            wp.showCmd = std::strcmp(max, "max") == 0 ? SW_SHOWMAXIMIZED : show;
+            SetWindowPlacement(app.wnd, &wp);
+            return;
+        }
+    }
+    ShowWindow(app.wnd, show);
+}
+
 void loadState(const std::wstring& arg) {
     Config c;
     ConfigExtras extras;
     std::string err;
     loadConfig(app.statePath, c, err, &extras);
+    savedWindow = extras["window"];
     app.configPath = extras["config_file"].empty() ? "" : normalizePath(joinPath(app.exeDir, extras["config_file"]));
     if (!app.configPath.empty() && !loadConfig(app.configPath, app.savedConfig, err)) app.configPath.clear();
     applyConfig(c);
@@ -1157,19 +1341,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     app.dpi = GetDeviceCaps(screen, LOGPIXELSX);
     ReleaseDC(nullptr, screen);
 
+    // default size, shrunk to fit small screens
+    RECT work;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    const int winW = std::min<int>(app.S(860), work.right - work.left);
+    const int winH = std::min<int>(app.S(830), work.bottom - work.top);
     app.wnd = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Logitech Script Bridge",
-                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, app.S(860),
-                              app.S(800), nullptr, nullptr, inst, nullptr);
+                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, work.left + (work.right - work.left - winW) / 2,
+                              work.top + (work.bottom - work.top - winH) / 2, winW, winH, nullptr, nullptr, inst, nullptr);
     createControls();
     enableDarkChrome();
     loadState(arg);
     layout();
     refreshChrome();
+    restoreWindow(show);
     DragAcceptFiles(app.wnd, TRUE);
     SetTimer(app.wnd, kLogTimer, 50, nullptr);
-    app.log("Pick a Logitech Lua script, choose your device and press Start (F5).\n"
-            "Ctrl+S saves the settings as a config, Ctrl+L loads one. Drop a .lua or .ini file on the window.\n");
-    ShowWindow(app.wnd, show);
+    app.log("Pick a script, choose your device and press Start (F5). Hover over a button to see its shortcut.\n");
     if (app.autoStart && !getText(IDC_SCRIPT).empty()) PostMessageW(app.wnd, WM_COMMAND, IDC_START, 0);
 
     MSG msg;
