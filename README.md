@@ -29,7 +29,7 @@ G HUB. This app runs those same scripts for everyone else:
 3. It sends the script's clicks, moves and key presses out through a **USB device**,
    which the PC sees as a real mouse and keyboard.
 
-It's a **single portable `.exe`** of about 700 KB, written in C++ with Lua built in.
+It's a **single portable `.exe`** of under 1 MB, written in C++ with Lua built in.
 There's no installer, no .NET and no Python, and it has no dependencies beyond Windows itself.
 
 ## Download
@@ -67,14 +67,33 @@ protocol should work with the MAKCU or KMBox setting.
 ## Quick start
 
 1. Download and run `LogitechScriptBridge-x64.exe`. Put it in its own folder: it saves its settings there.
-2. **Open script**: pick your `.lua` file (the same one you'd paste into G HUB). You can also drag it onto
-   the window, or keep your scripts in a `scripts\` folder next to the exe and pick them from the ⌄ menu.
+2. **Open**: pick your `.lua` file (the same one you'd paste into G HUB). You can also drag it onto
+   the window, keep your scripts in a `scripts\` folder next to the exe and pick them from **Scripts**,
+   or press **New** in the Script tab and write one right in the app.
 3. **Output device**: pick your hardware and its COM port (the ⌄ menu lists connected ports).
    Press **Test**: the mouse pointer should wiggle right and back.
-4. Press **Start** (F5). Script output (`OutputLogMessage`) appears in the log in white, app
+4. Press **Start** (F5). Script output (`OutputLogMessage`) appears in the **Log** tab in white, app
    messages in grey and errors in red. Hover over any button to see its keyboard shortcut.
 
 The window remembers its size and position.
+
+### Edit scripts in the app
+
+The **Script** tab is a built-in Lua editor, so you can tweak a script without leaving the app:
+
+- **Syntax colouring** for Lua and the G HUB functions, plus **line numbers**.
+- A **live syntax check** under the editor. A mistake shows up as *Line 13: unexpected symbol near '2'*
+  and its line number turns red, before you ever press Start.
+- **Enter** keeps the indent (and indents after `function`, `if`, `for`, `do`...), **Tab** inserts 4 spaces.
+- **Save** (Ctrl+S while typing) writes the file. If the script is running it restarts with the new code
+  straight away. **Start** saves unsaved changes first, and a script error jumps to the broken line.
+- **New** starts from a template with an `OnEvent` ready to fill in, **Revert** throws away unsaved changes
+  and **Expand** hides the other cards to give the editor the whole window.
+- The Script tab shows a dot while there are unsaved changes, and the app asks before closing or opening
+  another script so nothing is lost. The **Log** tab shows a dot when the script printed something new
+  (red for errors).
+
+Files keep their line endings (Windows or Unix) and are saved as UTF-8.
 
 ### Save and load configs
 

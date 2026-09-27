@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // Lua is compiled as C++ (see CMakeLists.txt) so script errors unwind as
@@ -97,6 +98,27 @@ Engine::Engine(Backend& out, InputState& input, LogFn log, Backend* keyFallback)
     : out_(out), input_(input), log_(std::move(log)), keyFallback_(keyFallback) {}
 
 Engine::~Engine() { stop(); }
+
+std::string Engine::checkSyntax(const std::string& source, const std::string& chunkName) {
+    lua_State* L = luaL_newstate();
+    std::string err;
+    if (luaL_loadbufferx(L, source.data(), source.size(), ("=" + chunkName).c_str(), "t") != LUA_OK) {
+        const char* m = lua_tostring(L, -1);
+        err = m ? m : "syntax error";
+    }
+    lua_close(L);
+    return err;
+}
+
+int Engine::errorLine(const std::string& message) {
+    for (size_t i = 0; i < message.size(); i++) {
+        if (message[i] != ':') continue;
+        size_t j = i + 1;
+        while (j < message.size() && message[j] >= '0' && message[j] <= '9') j++;
+        if (j > i + 1 && j < message.size() && message[j] == ':') return std::atoi(message.c_str() + i + 1);
+    }
+    return 0;
+}
 
 // ------------------------------------------------------------------ lifecycle
 

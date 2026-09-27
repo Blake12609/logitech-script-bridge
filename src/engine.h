@@ -63,6 +63,12 @@ public:
 
     std::function<void()> onClearLog;
 
+    // Compiles a script without running it. Returns "" if it's fine, otherwise
+    // the Lua message ("name:line: problem").
+    static std::string checkSyntax(const std::string& source, const std::string& chunkName);
+    // The line number in a Lua error message ("name:12: ..."), or 0.
+    static int errorLine(const std::string& message);
+
 private:
     struct Event {
         std::string name;

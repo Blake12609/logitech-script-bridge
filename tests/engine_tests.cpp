@@ -365,4 +365,15 @@ TEST(button_state_for_indicator) {
     CHECK(!phys && !script);
 }
 
+TEST(syntax_check_without_running) {
+    CHECK(Engine::checkSyntax("function OnEvent(e) OutputLogMessage('hi') end", "a.lua").empty());
+    const std::string err = Engine::checkSyntax("function OnEvent(e)\n  if e == 1 then\n    Sleep(1)\nend", "a.lua");
+    CHECK(err.find("a.lua:") == 0);
+    CHECK(Engine::errorLine(err) == 4);  // missing 'end' is reported at the end of the file
+    CHECK(Engine::errorLine("x.lua:12: unexpected symbol") == 12);
+    CHECK(Engine::errorLine("no line here") == 0);
+    // nothing runs: an endless loop at the top level still just compiles
+    CHECK(Engine::checkSyntax("while true do end", "b.lua").empty());
+}
+
 }  // namespace

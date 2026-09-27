@@ -18,6 +18,8 @@
 #include <dwmapi.h>
 #include <mmsystem.h>
 #include <richedit.h>
+#include <ole2.h>
+#include <tom.h>
 #include <shellapi.h>
 #include <uxtheme.h>
 
@@ -25,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <objidl.h>  // GDI+ needs COM declarations that WIN32_LEAN_AND_MEAN leaves out
 namespace Gdiplus {
 using std::max;
@@ -34,6 +37,7 @@ using std::min;
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -44,7 +48,7 @@ using std::min;
 
 namespace {
 
-const wchar_t* const kVersion = L"v1.4";
+const wchar_t* const kVersion = L"v1.5";
 
 // ------------------------------------------------------------------ theme
 
@@ -176,7 +180,7 @@ int textWidth(HDC dc, const std::wstring& s, HFONT font, int tracking = 0) {
 
 enum class Icon {
     None, Play, Stop, Folder, Save, Upload, Edit, Reload, List, Chevron, Check, Close, Minimize, Maximize,
-    Restore, Trash, Pointer, Info,
+    Restore, Trash, Pointer, Info, Plus,
 };
 
 void drawIcon(Canvas& c, Icon ic, const RECT& box, COLORREF col, float stroke) {
@@ -271,6 +275,10 @@ void drawIcon(Canvas& c, Icon ic, const RECT& box, COLORREF col, float stroke) {
             lines({P(0.5f, 0.46f), P(0.5f, 0.68f)});
             c.g.FillEllipse(&brush, x0 + 0.45f * s, y0 + 0.28f * s, 0.1f * s, 0.1f * s);
             break;
+        case Icon::Plus:
+            lines({P(0.5f, 0.2f), P(0.5f, 0.8f)});
+            lines({P(0.2f, 0.5f), P(0.8f, 0.5f)});
+            break;
         case Icon::None:
             break;
     }
@@ -293,12 +301,13 @@ void drawLogo(Canvas& c, const RECT& box) {
 enum Id {
     IDC_START = 100, IDC_OPEN, IDC_LIBRARY, IDC_EDIT, IDC_RELOAD, IDC_CONFIG, IDC_MIN, IDC_MAX, IDC_CLOSE,
     IDC_DEVICE, IDC_PORT, IDC_PORT_MENU, IDC_BAUD, IDC_TEST, IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_EXTRA, IDC_HOTKEY,
-    IDC_JITTER_MIN, IDC_JITTER_MAX, IDC_CLEAR, IDC_LOG,
+    IDC_JITTER_MIN, IDC_JITTER_MAX, IDC_CLEAR, IDC_LOG, IDC_TAB_SCRIPT, IDC_TAB_LOG, IDC_EDITOR, IDC_NEW,
+    IDC_REVERT, IDC_SAVESCRIPT, IDC_EXPAND,
     // commands without a control of their own (shortcuts and menus)
     IDC_STOP = 200, IDC_SAVECFG, IDC_SAVEAS, IDC_LOADCFG,
 };
 
-enum class Role { Hero, Ghost, Secondary, Dropdown, Chevron, Toggle, Caption, CaptionClose, Chip };
+enum class Role { Hero, Ghost, Secondary, Dropdown, Chevron, Toggle, Caption, CaptionClose, Chip, Tab };
 
 struct ButtonInfo {
     Role role;
@@ -306,7 +315,7 @@ struct ButtonInfo {
 };
 
 const UINT WM_APP_CLEARLOG = WM_APP + 1;
-const UINT_PTR kLogTimer = 1, kAnimTimer = 2;
+const UINT_PTR kLogTimer = 1, kAnimTimer = 2, kEditTimer = 3;
 const int kHotkeyId = 1;
 
 const char* const kExtraKeys[] = {"off", "mouse", "gkeys"};
@@ -408,6 +417,19 @@ struct App {
     HACCEL accel = nullptr;
     unsigned lastButtons = ~0u;
 
+    // script editor / log tabs
+    int tab = 0;               // 0 = script editor, 1 = log
+    bool expanded = false;     // device/options/mouse cards hidden to give the editor room
+    bool untitled = false;     // a new script that hasn't been saved yet
+    bool editorDirty = false, editorCrlf = true, loadingEditor = false, highlighting = false;
+    bool logUnseen = false, logUnseenError = false;
+    std::wstring editorSaved;  // text as last loaded/saved, to spot unsaved changes
+    std::string syntaxError;
+    int syntaxLine = 0;
+    LONG gutterFirst = -1, gutterCaret = -1;
+    ITextDocument* editorDoc = nullptr;
+    RECT tabsRect{}, gutterRect{}, statusRect{};
+
     // cached backdrop
     HDC backdropDC = nullptr;
     HBITMAP backdropBmp = nullptr;
@@ -481,13 +503,21 @@ void registerHotkey() {
                 LogKind::Error);
 }
 
+bool confirmDiscardEdits();
+void loadEditor(const std::string& path);
+
+// Switches to another script, offering to save unsaved edits first.
 void setScript(const std::string& path) {
+    if (path == app.scriptPath && !app.untitled) return;
+    if (!confirmDiscardEdits()) return;
     app.scriptPath = path;
+    app.untitled = false;
+    loadEditor(path);
     refreshChrome();
 }
 
 void applyConfig(const Config& c) {
-    app.scriptPath = c.script;
+    setScript(c.script);
     const DeviceInfo* d = findDevice(c.device);
     app.device = d ? static_cast<int>(d - kDevices) : 0;
     SetWindowTextW(app.item(IDC_PORT), widen(c.port).c_str());
@@ -542,6 +572,7 @@ void refreshChrome() {
         EnableWindow(app.item(id), !run);
     for (int id : {IDC_PORT, IDC_PORT_MENU, IDC_BAUD}) EnableWindow(app.item(id), !run && serial);
     EnableWindow(app.item(IDC_KEYFALLBACK), !run && !kDevices[app.device].keyboard);
+    EnableWindow(app.item(IDC_NEW), !run);
     InvalidateRect(app.wnd, &app.heroRect, FALSE);
     InvalidateRect(app.wnd, &app.helpRect, FALSE);
     for (int id : {IDC_CONFIG, IDC_START, IDC_DEVICE}) InvalidateRect(app.item(id), nullptr, FALSE);
@@ -578,6 +609,12 @@ void flushLog() {
         SendMessageW(box, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(widen(crlf).c_str()));
     }
     SendMessageW(box, WM_VSCROLL, SB_BOTTOM, 0);
+    if (app.tab != 1) {
+        app.logUnseen = true;
+        for (const auto& chunk : chunks)
+            if (chunk.first == LogKind::Error) app.logUnseenError = true;
+        InvalidateRect(app.item(IDC_TAB_LOG), nullptr, FALSE);
+    }
 }
 
 void clearLog() {
@@ -595,6 +632,413 @@ LogKind engineLogKind(const std::string& s) {
 }
 
 void dryRunLog(void*, const std::string& s) { app.log(s, LogKind::Dry); }
+
+// ------------------------------------------------------------------ script editor
+
+// Lua syntax highlighting: split the text into coloured spans.
+enum class Tok { Default, Keyword, Api, Builtin, String, Number, Comment };
+
+COLORREF tokColor(Tok t) {
+    switch (t) {
+        case Tok::Keyword: return RGB(0xc7, 0x92, 0xea);
+        case Tok::Api: return RGB(0x82, 0xaa, 0xff);
+        case Tok::Builtin: return RGB(0x89, 0xdd, 0xff);
+        case Tok::String: return RGB(0xc3, 0xe8, 0x8d);
+        case Tok::Number: return RGB(0xf7, 0x8c, 0x6c);
+        case Tok::Comment: return RGB(0x6b, 0x73, 0x85);
+        default: return RGB(0xd6, 0xdb, 0xe4);
+    }
+}
+
+Tok classifyWord(const std::wstring& w) {
+    static const std::set<std::wstring> keywords = {
+        L"and", L"break", L"do", L"else", L"elseif", L"end", L"false", L"for", L"function", L"goto", L"if", L"in",
+        L"local", L"nil", L"not", L"or", L"repeat", L"return", L"then", L"true", L"until", L"while"};
+    static const std::set<std::wstring> api = {
+        L"OnEvent", L"GetMKeyState", L"SetMKeyState", L"Sleep", L"OutputLogMessage", L"GetRunningTime", L"GetDate",
+        L"ClearLog", L"PressKey", L"ReleaseKey", L"PressAndReleaseKey", L"IsModifierPressed", L"PressMouseButton",
+        L"ReleaseMouseButton", L"PressAndReleaseMouseButton", L"IsMouseButtonPressed", L"MoveMouseTo",
+        L"MoveMouseWheel", L"MoveMouseRelative", L"MoveMouseToVirtual", L"GetMousePosition", L"OutputLCDMessage",
+        L"ClearLCD", L"PlayMacro", L"PressMacro", L"ReleaseMacro", L"AbortMacro", L"IsKeyLockOn", L"SetBacklightColor",
+        L"OutputDebugMessage", L"SetMouseDPITable", L"SetMouseDPITableIndex", L"EnablePrimaryMouseButtonEvents",
+        L"EnableHidEvents", L"SetSteeringWheelProperty"};
+    static const std::set<std::wstring> builtins = {
+        L"string", L"table", L"math", L"os", L"coroutine", L"utf8", L"print", L"pairs", L"ipairs", L"next", L"type",
+        L"tostring", L"tonumber", L"select", L"pcall", L"xpcall", L"error", L"assert", L"unpack", L"setmetatable",
+        L"getmetatable", L"rawget", L"rawset", L"rawequal", L"rawlen", L"load", L"loadstring", L"self"};
+    if (keywords.count(w)) return Tok::Keyword;
+    if (api.count(w)) return Tok::Api;
+    if (builtins.count(w)) return Tok::Builtin;
+    return Tok::Default;
+}
+
+struct Span {
+    LONG start, end;
+    Tok kind;
+};
+
+std::vector<Span> lexLua(const std::wstring& s) {
+    std::vector<Span> out;
+    const size_t n = s.size();
+    size_t i = 0;
+    // "[[" or "[==[" at p: returns true and the number of '='
+    auto longOpen = [&](size_t p, int& level) {
+        if (p >= n || s[p] != L'[') return false;
+        size_t q = p + 1;
+        level = 0;
+        while (q < n && s[q] == L'=') level++, q++;
+        return q < n && s[q] == L'[';
+    };
+    auto longClose = [&](size_t from, int level) {
+        for (size_t q = from; q < n; q++) {
+            if (s[q] != L']') continue;
+            size_t r = q + 1;
+            int l = 0;
+            while (r < n && s[r] == L'=') l++, r++;
+            if (l == level && r < n && s[r] == L']') return r + 1;
+        }
+        return n;
+    };
+    auto push = [&](size_t a, size_t b, Tok k) { out.push_back({static_cast<LONG>(a), static_cast<LONG>(b), k}); };
+    while (i < n) {
+        const wchar_t c = s[i];
+        int level = 0;
+        if (c == L'-' && i + 1 < n && s[i + 1] == L'-') {
+            const size_t st = i;
+            if (longOpen(i + 2, level)) i = longClose(i + 4 + level, level);
+            else
+                while (i < n && s[i] != L'\r' && s[i] != L'\n') i++;
+            push(st, i, Tok::Comment);
+        } else if (c == L'"' || c == L'\'') {
+            const size_t st = i++;
+            while (i < n && s[i] != c && s[i] != L'\r' && s[i] != L'\n') i += s[i] == L'\\' ? 2 : 1;
+            if (i < n && s[i] == c) i++;
+            push(st, std::min(i, n), Tok::String);
+        } else if (c == L'[' && longOpen(i, level)) {
+            const size_t st = i;
+            i = longClose(i + 2 + level, level);
+            push(st, i, Tok::String);
+        } else if (iswdigit(c) || (c == L'.' && i + 1 < n && iswdigit(s[i + 1]))) {
+            const size_t st = i;
+            if (c == L'0' && i + 1 < n && (s[i + 1] == L'x' || s[i + 1] == L'X')) {
+                i += 2;
+                while (i < n && (iswxdigit(s[i]) || s[i] == L'.')) i++;
+            } else {
+                while (i < n && (iswdigit(s[i]) || s[i] == L'.')) i++;
+                if (i < n && (s[i] == L'e' || s[i] == L'E')) {
+                    i++;
+                    if (i < n && (s[i] == L'+' || s[i] == L'-')) i++;
+                    while (i < n && iswdigit(s[i])) i++;
+                }
+            }
+            push(st, i, Tok::Number);
+        } else if (iswalpha(c) || c == L'_') {
+            const size_t st = i;
+            while (i < n && (iswalnum(s[i]) || s[i] == L'_')) i++;
+            const Tok k = classifyWord(s.substr(st, i - st));
+            if (k != Tok::Default) push(st, i, k);
+        } else {
+            i++;
+        }
+    }
+    return out;
+}
+
+HWND editor() { return app.item(IDC_EDITOR); }
+
+// crlf = true gives line breaks as "\r\n" (for saving); false gives the editor's own "\r".
+std::wstring editorText(bool crlf) {
+    GETTEXTLENGTHEX gl = {static_cast<DWORD>((crlf ? GTL_USECRLF : GTL_DEFAULT) | GTL_PRECISE | GTL_NUMCHARS), 1200};
+    const LONG len = static_cast<LONG>(SendMessageW(editor(), EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&gl), 0));
+    std::wstring buf(static_cast<size_t>(std::max<LONG>(len, 0)) + 1, L'\0');
+    GETTEXTEX gt = {};
+    gt.cb = static_cast<DWORD>(buf.size() * sizeof(wchar_t));
+    gt.flags = crlf ? GT_USECRLF : GT_DEFAULT;
+    gt.codepage = 1200;
+    const LONG got = static_cast<LONG>(
+        SendMessageW(editor(), EM_GETTEXTEX, reinterpret_cast<WPARAM>(&gt), reinterpret_cast<LPARAM>(&buf[0])));
+    buf.resize(static_cast<size_t>(std::max<LONG>(got, 0)));
+    return buf;
+}
+
+void setSpanFormat(HWND ed, LONG a, LONG b, COLORREF col, bool italic) {
+    CHARRANGE r = {a, b};
+    SendMessageW(ed, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&r));
+    CHARFORMAT2W cf = {};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR | CFM_ITALIC;
+    cf.crTextColor = col;
+    cf.dwEffects = italic ? CFE_ITALIC : 0;
+    SendMessageW(ed, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&cf));
+}
+
+void highlightEditor() {
+    HWND ed = editor();
+    const std::wstring textNow = editorText(false);
+    app.highlighting = true;
+    long frozen = 0;
+    if (app.editorDoc) {
+        app.editorDoc->Undo(tomSuspend, nullptr);  // colouring shouldn't end up in the undo history
+        app.editorDoc->Freeze(&frozen);
+    }
+    SendMessageW(ed, WM_SETREDRAW, FALSE, 0);
+    CHARRANGE sel;
+    SendMessageW(ed, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&sel));
+    POINT scroll = {};
+    SendMessageW(ed, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+
+    setSpanFormat(ed, 0, -1, tokColor(Tok::Default), false);
+    for (const Span& sp : lexLua(textNow)) setSpanFormat(ed, sp.start, sp.end, tokColor(sp.kind), sp.kind == Tok::Comment);
+
+    SendMessageW(ed, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&sel));
+    SendMessageW(ed, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    SendMessageW(ed, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ed, nullptr, FALSE);
+    if (app.editorDoc) {
+        app.editorDoc->Unfreeze(&frozen);
+        app.editorDoc->Undo(tomResume, nullptr);
+    }
+    app.highlighting = false;
+}
+
+std::string editorChunkName() { return app.scriptPath.empty() ? "untitled.lua" : fileName(app.scriptPath); }
+
+// Unsaved-changes flag and the live syntax check follow the editor text.
+void updateEditorState() {
+    const std::wstring textNow = editorText(false);
+    const bool dirty = app.untitled ? !textNow.empty() : textNow != app.editorSaved;
+    std::string src = narrow(textNow);
+    for (char& ch : src)
+        if (ch == '\r') ch = '\n';
+    const std::string err = src.empty() ? std::string() : Engine::checkSyntax(src, editorChunkName());
+    if (dirty != app.editorDirty || err != app.syntaxError) {
+        app.editorDirty = dirty;
+        app.syntaxError = err;
+        app.syntaxLine = Engine::errorLine(err);
+        for (int id : {IDC_TAB_SCRIPT, IDC_SAVESCRIPT, IDC_REVERT}) InvalidateRect(app.item(id), nullptr, FALSE);
+        InvalidateRect(app.wnd, &app.statusRect, FALSE);
+        InvalidateRect(app.wnd, &app.gutterRect, FALSE);
+        InvalidateRect(app.wnd, &app.heroRect, FALSE);
+    }
+    const bool canRevert = app.editorDirty && !app.untitled && !app.scriptPath.empty();
+    HWND revert = app.item(IDC_REVERT);
+    if (!canRevert && GetFocus() == revert) SetFocus(editor());
+    EnableWindow(revert, canRevert);
+}
+
+void setEditorText(const std::wstring& t) {
+    app.loadingEditor = true;
+    SetWindowTextW(editor(), t.c_str());
+    SendMessageW(editor(), EM_EMPTYUNDOBUFFER, 0, 0);
+    app.loadingEditor = false;
+    highlightEditor();
+    app.editorSaved = editorText(false);
+    app.editorDirty = false;
+    updateEditorState();
+    InvalidateRect(app.wnd, &app.gutterRect, FALSE);
+}
+
+void loadEditor(const std::string& path) {
+    std::string bytes;
+    if (!path.empty()) {
+        if (FILE* f = openUtf8(path, "rb")) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) bytes.append(buf, n);
+            fclose(f);
+        }
+    }
+    if (bytes.compare(0, 3, "\xEF\xBB\xBF") == 0) bytes.erase(0, 3);
+    app.editorCrlf = bytes.find('\n') == std::string::npos || bytes.find("\r\n") != std::string::npos;
+    // UTF-8, falling back to the Windows code page for old scripts
+    std::wstring text;
+    if (!bytes.empty()) {
+        int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+        const UINT cp = n > 0 ? CP_UTF8 : CP_ACP;
+        n = MultiByteToWideChar(cp, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+        text.assign(n, L'\0');
+        MultiByteToWideChar(cp, 0, bytes.data(), static_cast<int>(bytes.size()), &text[0], n);
+    }
+    setEditorText(text);
+}
+
+void refreshChrome();
+void stopScript();
+void startScript();
+std::string fileDialog(bool save, const wchar_t* filter, const std::string& initialDir, const std::string& initialName,
+                       const wchar_t* defExt);
+std::string ensureDir(const std::string& name);
+void errorBox(const std::wstring& title, const std::string& msg);
+
+// Writes the editor to disk (asking for a name for a new script). A running
+// script is restarted with the new code when `reload` is set.
+bool saveEditor(bool reload) {
+    std::string path = app.scriptPath;
+    if (path.empty() || app.untitled) {
+        path = fileDialog(true, L"Lua scripts (*.lua)\0*.lua\0All files (*.*)\0*.*\0", ensureDir("scripts"), "my_script.lua",
+                          L"lua");
+        if (path.empty()) return false;
+    }
+    std::wstring textNow = editorText(true);
+    if (!app.editorCrlf) {
+        std::wstring lf;
+        for (size_t i = 0; i < textNow.size(); i++)
+            if (!(textNow[i] == L'\r' && i + 1 < textNow.size() && textNow[i + 1] == L'\n')) lf += textNow[i];
+        textNow.swap(lf);
+    }
+    const std::string bytes = narrow(textNow);
+    FILE* f = openUtf8(path, "wb");
+    if (!f || fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size()) {
+        if (f) fclose(f);
+        errorBox(L"Save script", "Cannot write " + path);
+        return false;
+    }
+    fclose(f);
+    app.scriptPath = path;
+    app.untitled = false;
+    app.editorSaved = editorText(false);
+    app.editorDirty = true;  // force a refresh of everything that shows the saved state
+    updateEditorState();
+    app.log("Saved " + fileName(path) + "\n");
+    refreshChrome();
+    if (reload && app.running()) {
+        stopScript();
+        startScript();
+    }
+    return true;
+}
+
+bool confirmDiscardEdits() {
+    if (!editor()) return true;
+    updateEditorState();
+    if (!app.editorDirty) return true;
+    const std::wstring name = app.untitled || app.scriptPath.empty() ? L"the new script" : widen(fileName(app.scriptPath));
+    const int r = MessageBoxW(app.wnd, (L"Save your changes to " + name + L"?").c_str(), L"Unsaved changes",
+                              MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDCANCEL) return false;
+    if (r == IDYES) return saveEditor(false);
+    return true;
+}
+
+void layout();
+
+void showTab(int t) {
+    app.tab = t;
+    if (t == 1) app.logUnseen = app.logUnseenError = false;
+    layout();
+    if (t == 0) SetFocus(editor());
+}
+
+void gotoLine(int line) {
+    const LONG ci = static_cast<LONG>(SendMessageW(editor(), EM_LINEINDEX, std::max(line - 1, 0), 0));
+    if (ci < 0) return;
+    CHARRANGE r = {ci, ci};
+    SendMessageW(editor(), EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&r));
+    SendMessageW(editor(), EM_SCROLLCARET, 0, 0);
+    SetFocus(editor());
+}
+
+void newScript() {
+    if (!confirmDiscardEdits()) return;
+    app.scriptPath.clear();
+    app.untitled = true;
+    setEditorText(
+        L"-- New script. Press Save (Ctrl+S) to keep it, then Start (F5).\r"
+        L"function OnEvent(event, arg, family)\r"
+        L"    if event == \"PROFILE_ACTIVATED\" then\r"
+        L"        OutputLogMessage(\"Script started\\n\")\r"
+        L"    end\r"
+        L"\r"
+        L"    if event == \"MOUSE_BUTTON_PRESSED\" and arg == 4 then\r"
+        L"        OutputLogMessage(\"Back button pressed\\n\")\r"
+        L"    end\r"
+        L"end\r");
+    updateEditorState();
+    refreshChrome();
+    showTab(0);
+    gotoLine(7);
+}
+
+void revertScript() {
+    updateEditorState();
+    if (app.untitled || app.scriptPath.empty() || !app.editorDirty) return;
+    if (MessageBoxW(app.wnd, (L"Throw away your changes to " + widen(fileName(app.scriptPath)) + L"?").c_str(),
+                    L"Revert", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+        return;
+    loadEditor(app.scriptPath);
+    refreshChrome();
+}
+
+// Enter keeps the indentation of the current line, and indents one more step
+// after lines that open a block (then, do, else, repeat, function ...).
+void newlineWithIndent(HWND ed) {
+    CHARRANGE sel;
+    SendMessageW(ed, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&sel));
+    const LONG line = static_cast<LONG>(SendMessageW(ed, EM_EXLINEFROMCHAR, 0, sel.cpMin));
+    const LONG start = static_cast<LONG>(SendMessageW(ed, EM_LINEINDEX, line, 0));
+    wchar_t buf[2048];
+    *reinterpret_cast<WORD*>(buf) = 2047;
+    LONG len = static_cast<LONG>(SendMessageW(ed, EM_GETLINE, line, reinterpret_cast<LPARAM>(buf)));
+    std::wstring ln(buf, static_cast<size_t>(std::max<LONG>(0, std::min(len, sel.cpMin - start))));
+    while (!ln.empty() && (ln.back() == L'\r' || ln.back() == L'\n')) ln.pop_back();
+    size_t ws = 0;
+    while (ws < ln.size() && (ln[ws] == L' ' || ln[ws] == L'\t')) ws++;
+    std::wstring indent = ln.substr(0, ws);
+    std::wstring t = ln;
+    while (!t.empty() && iswspace(t.back())) t.pop_back();
+    auto endsWord = [&](const wchar_t* w) {
+        const size_t k = wcslen(w);
+        return t.size() >= k && t.compare(t.size() - k, k, w) == 0 &&
+               (t.size() == k || !(iswalnum(t[t.size() - k - 1]) || t[t.size() - k - 1] == L'_'));
+    };
+    const bool opensFunction = t.find(L"function") != std::wstring::npos && !t.empty() && t.back() == L')';
+    if (endsWord(L"then") || endsWord(L"do") || endsWord(L"else") || endsWord(L"repeat") || opensFunction ||
+        (!t.empty() && t.back() == L'{'))
+        indent += L"    ";
+    SendMessageW(ed, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>((L"\r" + indent).c_str()));
+}
+
+// Repaint the line numbers when the editor scrolled or the caret moved to another line.
+void checkGutter() {
+    HWND ed = editor();
+    const LONG first = static_cast<LONG>(SendMessageW(ed, EM_GETFIRSTVISIBLELINE, 0, 0));
+    CHARRANGE sel;
+    SendMessageW(ed, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&sel));
+    const LONG caret = static_cast<LONG>(SendMessageW(ed, EM_EXLINEFROMCHAR, 0, sel.cpMin));
+    if (first != app.gutterFirst || caret != app.gutterCaret) {
+        app.gutterFirst = first;
+        app.gutterCaret = caret;
+        InvalidateRect(app.wnd, &app.gutterRect, FALSE);
+    }
+}
+
+LRESULT CALLBACK editorProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    switch (msg) {
+        case WM_GETDLGCODE:
+            return DLGC_WANTALLKEYS | DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB | DLGC_HASSETSEL;
+        case WM_KEYDOWN:
+            if (wp == VK_TAB && !(GetKeyState(VK_CONTROL) & 0x8000)) {
+                if (!(GetKeyState(VK_SHIFT) & 0x8000))
+                    SendMessageW(h, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"    "));
+                return 0;
+            }
+            if (wp == VK_RETURN) {
+                newlineWithIndent(h);
+                return 0;
+            }
+            break;
+        case WM_CHAR:
+            if (wp == L'\t' || wp == L'\r' || wp == L'\n') return 0;  // handled in WM_KEYDOWN
+            break;
+        case WM_PASTE:
+            SendMessageW(h, EM_PASTESPECIAL, CF_UNICODETEXT, 0);  // paste plain text, not formatting
+            return 0;
+    }
+    const LRESULT r = DefSubclassProc(h, msg, wp, lp);
+    if (msg == WM_KEYDOWN || msg == WM_MOUSEWHEEL || msg == WM_VSCROLL || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP)
+        checkGutter();
+    return r;
+}
 
 // ------------------------------------------------------------------ dropdown lists
 
@@ -877,6 +1321,8 @@ std::unique_ptr<Backend> openDevice(const Config& c, std::string& err) {
 }
 
 void startScript() {
+    updateEditorState();
+    if (app.editorDirty && !saveEditor(false)) return;  // run what's in the editor
     const Config c = currentConfig();
     saveState();
     std::string source, err;
@@ -905,6 +1351,10 @@ void startScript() {
         setStatus(App::Status::Error);
         flushLog();
         refreshChrome();
+        if (const int line = Engine::errorLine(err)) {
+            if (app.tab != 0) showTab(0);
+            gotoLine(line);
+        }
         return;
     }
     if (!app.input.startHook(app.engine.get(), c.extraKeys, err)) {
@@ -1000,13 +1450,6 @@ void openScript() {
     const std::string path = fileDialog(false, L"Lua scripts (*.lua)\0*.lua\0All files (*.*)\0*.*\0",
                                         app.scriptPath.empty() ? ensureDir("scripts") : dirName(app.scriptPath), "", L"lua");
     if (!path.empty()) setScript(path);
-}
-
-void editScript() {
-    if (app.scriptPath.empty()) return openScript();
-    const std::wstring path = widen(app.scriptPath);
-    if (reinterpret_cast<INT_PTR>(ShellExecuteW(app.wnd, L"edit", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
-        ShellExecuteW(app.wnd, L"open", L"notepad.exe", (L"\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
 
 void libraryMenu() {
@@ -1151,16 +1594,27 @@ void paintBackdrop(Canvas& c, const RECT& client) {
     }
 
     // device help callout
-    fillRound(c, app.helpRect, app.Sf(9), Color::accent, 20);
-    strokeRound(c, app.helpRect, app.Sf(9), Color::accent, 1, 45);
+    if (!IsRectEmpty(&app.helpRect)) {
+        fillRound(c, app.helpRect, app.Sf(9), Color::accent, 20);
+        strokeRound(c, app.helpRect, app.Sf(9), Color::accent, 1, 45);
+    }
+
+    // Script / Log tab strip
+    fillRound(c, app.tabsRect, app.Sf(9), Color::field);
+    strokeRound(c, app.tabsRect, app.Sf(9), Color::border);
 
     // boxes behind edit controls
     HWND focus = GetFocus();
     for (const auto& f : app.fields) {
-        const bool isLog = f.first == IDC_LOG;
-        fillRound(c, f.second, app.Sf(8), isLog ? Color::logBg : Color::field);
-        const bool focused = !isLog && focus == app.item(f.first);
+        const bool isCode = f.first == IDC_LOG || f.first == IDC_EDITOR;
+        fillRound(c, f.second, app.Sf(8), isCode ? Color::logBg : Color::field);
+        const bool focused = !isCode && focus == app.item(f.first);
         strokeRound(c, f.second, app.Sf(8), focused ? Color::accent : Color::border, focused ? app.Sf(1.5f) : 1);
+    }
+    if (app.tab == 0 && !IsRectEmpty(&app.gutterRect)) {
+        RECT line = {app.gutterRect.right - 1, app.gutterRect.top + app.S(1), app.gutterRect.right,
+                     app.gutterRect.bottom - app.S(1)};
+        fillRound(c, line, 0, Color::border);
     }
 }
 
@@ -1239,7 +1693,10 @@ void drawButton(const DRAWITEMSTRUCT* di) {
             }
             case Role::Ghost:
             case Role::Secondary: {
-                if (info.role == Role::Secondary) {
+                const bool emphasis = id == IDC_SAVESCRIPT && app.editorDirty && !disabled;
+                if (emphasis) {
+                    gradientRound(c, wr, radius, hover ? Color::accentHover : Color::accent, Color::accent2, 30);
+                } else if (info.role == Role::Secondary) {
                     fillRound(c, wr, radius, hover ? Color::fieldHover : Color::field);
                     strokeRound(c, wr, radius, hover ? Color::borderHover : Color::border);
                 } else if (hover || pressed) {
@@ -1252,12 +1709,13 @@ void drawButton(const DRAWITEMSTRUCT* di) {
                 const int x = wr.left + (w - total) / 2;
                 if (info.icon != Icon::None) {
                     RECT ib = {x, wr.top + (h - is) / 2, x + is, wr.top + (h - is) / 2 + is};
-                    drawIcon(c, info.icon, ib, disabled ? Color::faint : hover ? Color::white : Color::muted,
+                    drawIcon(c, info.icon, ib,
+                             emphasis ? Color::white : disabled ? Color::faint : hover ? Color::white : Color::muted,
                              app.Sf(1.6f));
                 }
                 if (!label.empty()) {
                     RECT tr = {x + (info.icon != Icon::None ? is + gap : 0), wr.top, wr.right, wr.bottom};
-                    text(c, label, tr, app.font, fg);
+                    text(c, label, tr, emphasis ? app.fontBold : app.font, emphasis ? Color::white : fg);
                 }
                 if (focus) strokeRound(c, wr, radius, Color::accent, app.Sf(1.5f), 180);
                 break;
@@ -1318,6 +1776,29 @@ void drawButton(const DRAWITEMSTRUCT* di) {
                 drawIcon(c, glyph, ib, hover ? Color::white : Color::text, app.Sf(1.2f));
                 break;
             }
+            case Role::Tab: {
+                const bool selected = (id == IDC_TAB_SCRIPT) == (app.tab == 0);
+                if (selected) {
+                    fillRound(c, wr, app.Sf(7), Color::white, 20);
+                    strokeRound(c, wr, app.Sf(7), Color::white, 1, 18);
+                } else if (hover) {
+                    fillRound(c, wr, app.Sf(7), Color::white, 8);
+                }
+                // a dot for unsaved edits / unseen log output
+                COLORREF dot = CLR_INVALID;
+                if (id == IDC_TAB_SCRIPT && app.editorDirty) dot = Color::accent;
+                if (id == IDC_TAB_LOG && app.logUnseen) dot = app.logUnseenError ? Color::danger : Color::muted;
+                HFONT f = selected ? app.fontBold : app.font;
+                const int tw = textWidth(mem, label, f), ds = dot == CLR_INVALID ? 0 : app.S(12);
+                const int x = wr.left + (w - tw - ds) / 2;
+                RECT tr = {x, wr.top, x + tw + app.S(2), wr.bottom};
+                text(c, label, tr, f, selected ? Color::white : hover ? Color::text : Color::muted);
+                if (dot != CLR_INVALID) {
+                    Gdiplus::SolidBrush db(gp(dot));
+                    c.g.FillEllipse(&db, x + tw + app.Sf(6) - c.ox, wr.top + h / 2.0f - app.Sf(3) - c.oy, app.Sf(6), app.Sf(6));
+                }
+                break;
+            }
             case Role::Chip: {
                 const float r = h / 2.0f;
                 fillRound(c, wr, r, hover ? Color::fieldHover : Color::field, 230);
@@ -1349,6 +1830,7 @@ void drawButton(const DRAWITEMSTRUCT* di) {
 
 // Mouse picture whose buttons light up: filled = pressed on the mouse, outlined = held by the script.
 void paintMouse(Canvas& c) {
+    if (IsRectEmpty(&app.mouseCard)) return;
     bool phys[6] = {}, script[6] = {};
     for (int n = 1; n <= 5 && app.engine; n++) app.engine->buttonState(n, phys[n], script[n]);
     const bool live = app.running();
@@ -1503,10 +1985,12 @@ void paintWindow(HDC target) {
         RECT btn = clientRectOf(IDC_START);
         const bool hasScript = !app.scriptPath.empty();
         RECT name = {hero.left + pad, hero.top + app.S(50), btn.left - app.S(40), hero.top + app.S(88)};
-        std::wstring scriptName = hasScript ? widen(fileName(app.scriptPath)) : L"No script selected";
+        std::wstring scriptName = app.untitled ? L"Untitled script"
+                                  : hasScript  ? widen(fileName(app.scriptPath))
+                                               : L"No script selected";
         if (hasScript && scriptName.size() > 4 && _wcsicmp(scriptName.c_str() + scriptName.size() - 4, L".lua") == 0)
             scriptName = scriptName.substr(0, scriptName.size() - 4);
-        text(c, scriptName, name, app.fontHero, hasScript ? Color::white : Color::muted);
+        text(c, scriptName, name, app.fontHero, hasScript || app.untitled ? Color::white : Color::muted);
 
         std::wstring sub;
         if (hasScript) {
@@ -1517,9 +2001,12 @@ void paintWindow(HDC target) {
             if (std::max(jmin, jmax) > 0)
                 sub += L"   ·   wobble " + formatPx(std::min(jmin, jmax)) + L"–" + formatPx(std::max(jmin, jmax)) + L" px";
             if (kHotkeys[app.hotkey].vk) sub += L"   ·   " + std::wstring(kHotkeys[app.hotkey].label) + L" starts/stops";
+        } else if (app.untitled) {
+            sub = L"Not saved yet   ·   press Save (Ctrl+S) in the editor to keep it";
         } else {
-            sub = L"Open a Logitech G HUB .lua script to get started, or drop one on this window";
+            sub = L"Open a Logitech G HUB .lua script, write a new one, or drop one on this window";
         }
+        if (hasScript && app.editorDirty) sub = L"Unsaved changes   ·   " + sub;
         RECT subr = {hero.left + pad, hero.top + app.S(88), btn.left - app.S(40), hero.top + app.S(108)};
         text(c, sub, subr, app.font, Color::muted);
 
@@ -1548,19 +2035,80 @@ void paintWindow(HDC target) {
                        card.rect.top + app.S(30)};
             text(c, card.caption, cr, app.fontCaption, Color::muted, DT_LEFT | DT_VCENTER, 1);
         }
-        RECT lr = {app.mouseCard.left, app.mouseCard.top + app.S(14), app.mouseCard.right - app.S(18),
-                   app.mouseCard.top + app.S(30)};
-        text(c, app.running() ? L"● LIVE" : L"IDLE", lr, app.fontCaption, app.running() ? Color::success : Color::faint,
-             DT_RIGHT | DT_VCENTER, 1);
+        if (!IsRectEmpty(&app.mouseCard)) {
+            RECT lr = {app.mouseCard.left, app.mouseCard.top + app.S(14), app.mouseCard.right - app.S(18),
+                       app.mouseCard.top + app.S(30)};
+            text(c, app.running() ? L"● LIVE" : L"IDLE", lr, app.fontCaption,
+                 app.running() ? Color::success : Color::faint, DT_RIGHT | DT_VCENTER, 1);
+        }
         for (const auto& l : app.labels) text(c, l.text, l.rect, app.fontSmall, Color::muted);
 
         // device help callout
-        RECT ib = {app.helpRect.left + app.S(12), app.helpRect.top + app.S(12), app.helpRect.left + app.S(28),
-                   app.helpRect.top + app.S(28)};
-        drawIcon(c, Icon::Info, ib, Color::accentHover, app.Sf(1.5f));
-        RECT ht = {app.helpRect.left + app.S(38), app.helpRect.top + app.S(11), app.helpRect.right - app.S(12),
-                   app.helpRect.bottom - app.S(8)};
-        text(c, kDeviceHelp[app.device], ht, app.font, mix(Color::text, Color::muted, 0.35), DT_LEFT | DT_WORDBREAK);
+        if (!IsRectEmpty(&app.helpRect)) {
+            RECT ib = {app.helpRect.left + app.S(12), app.helpRect.top + app.S(12), app.helpRect.left + app.S(28),
+                       app.helpRect.top + app.S(28)};
+            drawIcon(c, Icon::Info, ib, Color::accentHover, app.Sf(1.5f));
+            RECT ht = {app.helpRect.left + app.S(38), app.helpRect.top + app.S(11), app.helpRect.right - app.S(12),
+                       app.helpRect.bottom - app.S(8)};
+            text(c, kDeviceHelp[app.device], ht, app.font, mix(Color::text, Color::muted, 0.35), DT_LEFT | DT_WORDBREAK);
+        }
+
+        // editor: line numbers and the live syntax check
+        if (app.tab == 0) {
+            HWND ed = editor();
+            const RECT er = clientRectOf(IDC_EDITOR);
+            const LONG first = static_cast<LONG>(SendMessageW(ed, EM_GETFIRSTVISIBLELINE, 0, 0));
+            const LONG count = static_cast<LONG>(SendMessageW(ed, EM_GETLINECOUNT, 0, 0));
+            CHARRANGE sel;
+            SendMessageW(ed, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&sel));
+            const LONG caret = static_cast<LONG>(SendMessageW(ed, EM_EXLINEFROMCHAR, 0, sel.cpMin));
+            HRGN clip = CreateRectRgn(app.gutterRect.left, er.top, app.gutterRect.right, er.bottom);
+            SelectClipRgn(dc, clip);
+            for (LONG ln = first; ln < count; ln++) {
+                const LONG ci = static_cast<LONG>(SendMessageW(ed, EM_LINEINDEX, ln, 0));
+                if (ci < 0) break;
+                POINTL pos = {};
+                SendMessageW(ed, EM_POSFROMCHAR, reinterpret_cast<WPARAM>(&pos), ci);
+                const int y = er.top + pos.y;
+                if (y > er.bottom) break;
+                RECT nr = {app.gutterRect.left, y, app.gutterRect.right - app.S(10), y + app.S(24)};
+                const bool bad = ln + 1 == app.syntaxLine;
+                text(c, std::to_wstring(ln + 1), nr, app.fontMono,
+                     bad ? Color::danger : ln == caret ? Color::text : Color::faint, DT_RIGHT | DT_TOP);
+                if (bad) {
+                    Gdiplus::SolidBrush eb(gp(Color::danger));
+                    c.g.FillEllipse(&eb, app.gutterRect.left + app.Sf(7), y + app.Sf(5), app.Sf(6), app.Sf(6));
+                }
+            }
+            SelectClipRgn(dc, nullptr);
+            DeleteObject(clip);
+
+            std::wstring status;
+            COLORREF sc = Color::faint;
+            if (!app.syntaxError.empty()) {
+                std::string msg = app.syntaxError;
+                const size_t cut = msg.find(": ", msg.find(':') + 1);
+                if (app.syntaxLine && cut != std::string::npos) msg = msg.substr(cut + 2);
+                status = (app.syntaxLine ? L"Line " + std::to_wstring(app.syntaxLine) + L": " : L"") + widen(msg);
+                sc = Color::danger;
+            } else if (editorText(false).empty()) {
+                status = L"Empty script";
+            } else {
+                status = L"No syntax errors";
+                sc = mix(Color::success, Color::muted, 0.3);
+            }
+            RECT st = app.statusRect;
+            if (app.syntaxError.empty() && !status.empty() && status != L"Empty script") {
+                RECT ib = {st.left, (st.top + st.bottom) / 2 - app.S(7), st.left + app.S(14), (st.top + st.bottom) / 2 + app.S(7)};
+                drawIcon(c, Icon::Check, ib, sc, app.Sf(1.8f));
+                st.left += app.S(20);
+            } else if (!app.syntaxError.empty()) {
+                RECT ib = {st.left, (st.top + st.bottom) / 2 - app.S(7), st.left + app.S(14), (st.top + st.bottom) / 2 + app.S(7)};
+                drawIcon(c, Icon::Info, ib, sc, app.Sf(1.5f));
+                st.left += app.S(20);
+            }
+            text(c, status, st, app.fontSmall, sc);
+        }
 
         paintMouse(c);
     }
@@ -1585,6 +2133,7 @@ void layout() {
     };
     app.cards.clear();
     app.labels.clear();
+    app.fields.clear();
 
     // title bar
     app.titleH = app.S(44);
@@ -1612,7 +2161,11 @@ void layout() {
         x += app.S(b.width) + app.S(4);
     }
 
-    // device / options / mouse cards
+    // device / options / mouse cards (hidden while the editor is expanded)
+    const bool showCards = !app.expanded;
+    for (int id : {IDC_DEVICE, IDC_PORT, IDC_PORT_MENU, IDC_BAUD, IDC_TEST, IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_EXTRA,
+                   IDC_HOTKEY, IDC_JITTER_MIN, IDC_JITTER_MAX})
+        ShowWindow(app.item(id), showCards ? SW_SHOW : SW_HIDE);
     const int y = app.heroRect.bottom + gap, cardH = app.S(262);
     const int mouseW = app.S(230), avail = W - 2 * m - 2 * gap - mouseW;
     const int devW = avail * 45 / 100, optW = avail - devW;
@@ -1657,12 +2210,50 @@ void layout() {
     app.legendRect = {app.mouseCard.left + app.S(12), app.mouseCard.bottom - app.S(38), app.mouseCard.right - app.S(12),
                       app.mouseCard.bottom - app.S(14)};
 
-    // log
-    const int ly = y + cardH + gap;
-    app.cards.push_back({{m, ly, W - m, H - m}, L"LOG"});
-    place(IDC_CLEAR, W - m - pad - app.S(84), ly + app.S(8), app.S(84), app.S(28));
-    app.fields[IDC_LOG] = {m + pad, ly + app.S(42), W - m - pad, H - m - pad};
-    place(IDC_LOG, m + pad + app.S(10), ly + app.S(50), W - 2 * m - 2 * pad - app.S(14), H - m - pad - ly - app.S(56));
+    if (!showCards) {
+        app.cards.clear();
+        app.labels.clear();
+        app.fields.clear();
+        app.helpRect = app.mouseCard = app.mouseArea = app.legendRect = RECT{};
+    }
+
+    // script editor / log, sharing one card with tabs
+    const int ly = showCards ? y + cardH + gap : app.heroRect.bottom + gap;
+    app.cards.push_back({{m, ly, W - m, H - m}, L""});
+    app.tabsRect = {m + pad - app.S(4), ly + app.S(10), m + pad - app.S(4) + app.S(176), ly + app.S(42)};
+    place(IDC_TAB_SCRIPT, app.tabsRect.left + app.S(3), app.tabsRect.top + app.S(3), app.S(84), app.S(26));
+    place(IDC_TAB_LOG, app.tabsRect.left + app.S(89), app.tabsRect.top + app.S(3), app.S(84), app.S(26));
+    const bool script = app.tab == 0;
+    int rx = W - m - pad + app.S(4);
+    auto header = [&](int id, int width, bool visible) {
+        ShowWindow(app.item(id), visible ? SW_SHOW : SW_HIDE);
+        if (!visible) return;
+        rx -= app.S(width);
+        place(id, rx, ly + app.S(10), app.S(width), app.S(32));
+        rx -= app.S(4);
+    };
+    header(IDC_EXPAND, 34, true);
+    header(IDC_SAVESCRIPT, 86, script);
+    header(IDC_REVERT, 92, script);
+    header(IDC_NEW, 76, script);
+    header(IDC_CLEAR, 84, !script);
+    app.statusRect = script ? RECT{app.tabsRect.right + app.S(16), ly + app.S(10), rx - app.S(8), ly + app.S(42)} : RECT{};
+
+    const RECT box = {m + pad, ly + app.S(52), W - m - pad, H - m - pad};
+    ShowWindow(app.item(IDC_EDITOR), script ? SW_SHOW : SW_HIDE);
+    ShowWindow(app.item(IDC_LOG), script ? SW_HIDE : SW_SHOW);
+    if (script) {
+        app.fields[IDC_EDITOR] = box;
+        app.gutterRect = {box.left, box.top, box.left + app.S(50), box.bottom};
+        place(IDC_EDITOR, app.gutterRect.right + app.S(10), box.top + app.S(8), box.right - app.gutterRect.right - app.S(14),
+              box.bottom - box.top - app.S(12));
+    } else {
+        app.fields[IDC_LOG] = box;
+        app.gutterRect = RECT{};
+        place(IDC_LOG, box.left + app.S(10), box.top + app.S(8), box.right - box.left - app.S(14),
+              box.bottom - box.top - app.S(14));
+    }
+    app.gutterFirst = app.gutterCaret = -1;
 
     // controls were moved without repainting; redraw everything at the new size
     redrawAll();
@@ -1738,6 +2329,7 @@ void enableDarkChrome() {
         }
     }
     SetWindowTheme(app.item(IDC_LOG), L"DarkMode_Explorer", nullptr);
+    SetWindowTheme(app.item(IDC_EDITOR), L"DarkMode_Explorer", nullptr);
 }
 
 void createControls() {
@@ -1775,9 +2367,45 @@ void createControls() {
     make(L"EDIT", L"0", ES_AUTOHSCROLL, IDC_JITTER_MIN);
     make(L"EDIT", L"0", ES_AUTOHSCROLL, IDC_JITTER_MAX);
     button(IDC_CLEAR, L"Clear", Role::Ghost, Icon::Trash);
+    button(IDC_TAB_SCRIPT, L"Script", Role::Tab);
+    button(IDC_TAB_LOG, L"Log", Role::Tab);
+    button(IDC_NEW, L"New", Role::Ghost, Icon::Plus);
+    button(IDC_REVERT, L"Revert", Role::Ghost, Icon::Reload);
+    button(IDC_SAVESCRIPT, L"Save", Role::Secondary, Icon::Save);
+    button(IDC_EXPAND, L"", Role::Ghost, Icon::Maximize);
+
+    // script editor (rich edit with Lua colouring)
+    LoadLibraryW(L"Msftedit.dll");
+    HWND ed = make(MSFTEDIT_CLASS, L"",
+                   WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | ES_WANTRETURN,
+                   IDC_EDITOR, nullptr);
+    SendMessageW(ed, EM_EXLIMITTEXT, 0, 4 * 1024 * 1024);
+    SendMessageW(ed, EM_SETTARGETDEVICE, 0, 1);  // no word wrap: one line of code per line
+    SendMessageW(ed, EM_SETBKGNDCOLOR, 0, Color::logBg);
+    SendMessageW(ed, EM_SETUNDOLIMIT, 500, 0);
+    {
+        CHARFORMAT2W ef = {};
+        ef.cbSize = sizeof(ef);
+        ef.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_CHARSET | CFM_ITALIC | CFM_BOLD;
+        ef.crTextColor = tokColor(Tok::Default);
+        ef.yHeight = 13 * 72 * 20 / 96;
+        ef.bCharSet = DEFAULT_CHARSET;
+        lstrcpynW(ef.szFaceName, app.monoFace.c_str(), LF_FACESIZE);
+        SendMessageW(ed, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&ef));
+    }
+    SendMessageW(ed, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_UPDATE);
+    SetWindowSubclass(ed, editorProc, 0, 0);
+    {
+        // text object model: lets colouring skip the undo history
+        const GUID iidTextDocument = {0x8CC497C0, 0xA1DF, 0x11CE, {0x80, 0x98, 0x00, 0xAA, 0x00, 0x47, 0xBE, 0x5D}};
+        IUnknown* unk = nullptr;
+        if (SendMessageW(ed, EM_GETOLEINTERFACE, 0, reinterpret_cast<LPARAM>(&unk)) && unk) {
+            unk->QueryInterface(iidTextDocument, reinterpret_cast<void**>(&app.editorDoc));
+            unk->Release();
+        }
+    }
 
     // colour-coded log (rich edit)
-    LoadLibraryW(L"Msftedit.dll");
     HWND log = make(MSFTEDIT_CLASS, L"", WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG, app.fontMono);
     SendMessageW(log, EM_EXLIMITTEXT, 0, 8 * 1024 * 1024);
     SendMessageW(log, EM_SETBKGNDCOLOR, 0, Color::logBg);
@@ -1805,7 +2433,13 @@ void createControls() {
         {IDC_START, L"Start the script (F5) / stop it (Shift+F5)"},
         {IDC_OPEN, L"Open a .lua script (Ctrl+O)"},
         {IDC_LIBRARY, L"Scripts in the scripts\\ and examples\\ folders next to the app"},
-        {IDC_EDIT, L"Open the script in your text editor (Ctrl+E)"},
+        {IDC_EDIT, L"Edit the script right here (Ctrl+E)"},
+        {IDC_TAB_SCRIPT, L"Edit the script (Ctrl+E)"},
+        {IDC_TAB_LOG, L"What the script printed, plus app messages"},
+        {IDC_NEW, L"Start a new script from a template"},
+        {IDC_REVERT, L"Throw away unsaved changes"},
+        {IDC_SAVESCRIPT, L"Save the script (Ctrl+S while editing). A running script restarts with the new code"},
+        {IDC_EXPAND, L"More room for the editor (hides the device and options cards)"},
         {IDC_RELOAD, L"Restart the script after editing it (Ctrl+R)"},
         {IDC_CONFIG, L"Save, save as or load a config"},
         {IDC_PORT_MENU, L"Serial ports that are plugged in right now"},
@@ -1864,10 +2498,31 @@ void onCommand(int id, int code) {
         case IDC_LOADCFG:
             if (!app.running()) loadConfigDialog();
             break;
-        case IDC_SAVECFG: saveConfigFile(); break;
+        case IDC_SAVECFG:
+            // Ctrl+S saves the script while you're typing in it, otherwise the config
+            if (GetFocus() == editor()) saveEditor(true);
+            else saveConfigFile();
+            break;
         case IDC_SAVEAS: saveConfigAs(); break;
         case IDC_CONFIG: configMenu(); break;
-        case IDC_EDIT: editScript(); break;
+        case IDC_EDIT: showTab(0); break;
+        case IDC_TAB_SCRIPT: showTab(0); break;
+        case IDC_TAB_LOG: showTab(1); break;
+        case IDC_NEW: newScript(); break;
+        case IDC_REVERT: revertScript(); break;
+        case IDC_SAVESCRIPT: saveEditor(true); break;
+        case IDC_EXPAND:
+            app.expanded = !app.expanded;
+            app.buttons[IDC_EXPAND].icon = app.expanded ? Icon::Restore : Icon::Maximize;
+            layout();
+            break;
+        case IDC_EDITOR:
+            if (code == EN_CHANGE && !app.loadingEditor && !app.highlighting) {
+                SetTimer(app.wnd, kEditTimer, 250, nullptr);  // recolour + re-check once typing pauses
+                InvalidateRect(app.wnd, &app.gutterRect, FALSE);
+            }
+            if (code == EN_UPDATE) checkGutter();
+            break;
         case IDC_PORT_MENU: portMenu(); break;
         case IDC_DEVICE: deviceMenu(); break;
         case IDC_EXTRA: extraMenu(); break;
@@ -1971,6 +2626,11 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     app.lastButtons = bits;
                     InvalidateRect(hwnd, &app.mouseCard, FALSE);
                 }
+            } else if (wp == kEditTimer) {
+                KillTimer(hwnd, kEditTimer);
+                highlightEditor();
+                updateEditorState();
+                InvalidateRect(hwnd, &app.gutterRect, FALSE);
             } else if (wp == kAnimTimer) {
                 if (app.running()) InvalidateRect(hwnd, &app.ringRect, FALSE);
                 for (auto it = app.anims.begin(); it != app.anims.end();) {
@@ -1990,6 +2650,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             clearLog();
             return 0;
         case WM_CLOSE:
+            if (!confirmDiscardEdits()) return 0;
             stopScript();
             saveState();
             DestroyWindow(hwnd);
@@ -2081,7 +2742,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     RECT work;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     const int winW = std::min<int>(app.S(1080), work.right - work.left);
-    const int winH = std::min<int>(app.S(800), work.bottom - work.top);
+    const int winH = std::min<int>(app.S(860), work.bottom - work.top);
     app.wnd = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Logitech Script Bridge",
                               WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, work.left + (work.right - work.left - winW) / 2,
                               work.top + (work.bottom - work.top - winH) / 2, winW, winH, nullptr, nullptr, inst, nullptr);
