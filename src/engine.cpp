@@ -300,21 +300,31 @@ void Engine::sleepMs(double ms) {
     qcv_.wait_until(lock, end, [&] { return abort_.load(); });
 }
 
-void Engine::setJitter(int x, int y, unsigned seed) {
-    jitterX_ = std::max(0, x);
-    jitterY_ = std::max(0, y);
+void Engine::setJitter(double minPx, double maxPx, unsigned seed) {
+    auto clean = [](double v) { return std::isfinite(v) ? std::min(std::max(v, 0.0), 100.0) : 0.0; };
+    jitterMin_ = clean(minPx);
+    jitterMax_ = clean(maxPx);
+    if (jitterMin_ > jitterMax_) std::swap(jitterMin_, jitterMax_);
     rng_.seed(seed);
 }
 
-int Engine::pickJitter(int range) {
-    return range ? std::uniform_int_distribution<int>(-range, range)(rng_) : 0;
+// A random offset between jitterMin_ and jitterMax_ pixels away, in a random direction,
+// rounded to whole pixels (so it can be up to ~0.7 px off the exact distance).
+void Engine::pickOffset(int& x, int& y) {
+    x = y = 0;
+    if (jitterMax_ <= 0) return;
+    const double dist = std::uniform_real_distribution<double>(jitterMin_, jitterMax_)(rng_);
+    const double angle = std::uniform_real_distribution<double>(0.0, 6.283185307179586)(rng_);
+    x = static_cast<int>(std::lround(dist * std::cos(angle)));
+    y = static_cast<int>(std::lround(dist * std::sin(angle)));
 }
 
 // Each move picks a fresh offset and corrects for the previous one, so the
 // error stays within the range instead of adding up over a long stroke.
 void Engine::moveWithJitter(int dx, int dy) {
-    if ((jitterX_ || jitterY_) && (dx || dy)) {
-        const int nx = pickJitter(jitterX_), ny = pickJitter(jitterY_);
+    if (jitterMax_ > 0 && (dx || dy)) {
+        int nx, ny;
+        pickOffset(nx, ny);
         dx += nx - offX_;
         dy += ny - offY_;
         offX_ = nx;
@@ -471,8 +481,7 @@ int Engine::l_moveTo(lua_State* L) {
     int left, top, w, h;
     e->input_.screenRect(lua_toboolean(L, 3), left, top, w, h);
     // with randomizing on, aim for a spot near the target; later relative moves wobble around it
-    e->offX_ = e->pickJitter(e->jitterX_);
-    e->offY_ = e->pickJitter(e->jitterY_);
+    e->pickOffset(e->offX_, e->offY_);
     const int tx = left + static_cast<int>(std::lround(luaL_checknumber(L, 1) * (w - 1) / 65535.0)) + e->offX_;
     const int ty = top + static_cast<int>(std::lround(luaL_checknumber(L, 2) * (h - 1) / 65535.0)) + e->offY_;
     for (int i = 0; i < 3; i++) {

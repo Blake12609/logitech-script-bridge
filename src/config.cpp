@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <vector>
 #include <cstdlib>
 
@@ -32,6 +33,11 @@ std::string trim(const std::string& s) {
 
 bool parseBool(const std::string& v) { return v == "1" || v == "true" || v == "yes" || v == "on"; }
 
+double parseNumber(const std::string& v) {
+    const double d = std::strtod(v.c_str(), nullptr);
+    return std::isfinite(d) && d > 0 ? d : 0;
+}
+
 bool samePathChar(char a, char b) {
     if (isSep(a) && isSep(b)) return true;
 #ifdef _WIN32
@@ -46,7 +52,7 @@ bool samePathChar(char a, char b) {
 bool Config::operator==(const Config& o) const {
     return script == o.script && device == o.device && port == o.port && baud == o.baud &&
            keyFallback == o.keyFallback && extraKeys == o.extraKeys && autoStart == o.autoStart &&
-           jitterX == o.jitterX && jitterY == o.jitterY && hotkey == o.hotkey;
+           jitterMin == o.jitterMin && jitterMax == o.jitterMax && hotkey == o.hotkey;
 }
 
 FILE* openUtf8(const std::string& path, const char* mode) {
@@ -168,11 +174,11 @@ bool saveConfig(const std::string& path, const Config& c, std::string& error, co
                  "key_fallback=%d\r\n"
                  "extra_keys=%s\r\n"
                  "auto_start=%d\r\n"
-                 "jitter_x=%d\r\n"
-                 "jitter_y=%d\r\n"
+                 "jitter_min=%g\r\n"
+                 "jitter_max=%g\r\n"
                  "hotkey=%s\r\n",
                  script.c_str(), c.device.c_str(), c.port.c_str(), c.baud, c.keyFallback ? 1 : 0,
-                 c.extraKeys.c_str(), c.autoStart ? 1 : 0, c.jitterX, c.jitterY, c.hotkey.c_str());
+                 c.extraKeys.c_str(), c.autoStart ? 1 : 0, c.jitterMin, c.jitterMax, c.hotkey.c_str());
     if (extras)
         for (const auto& kv : *extras) std::fprintf(f, "%s=%s\r\n", kv.first.c_str(), kv.second.c_str());
     const bool ok = std::fclose(f) == 0;
@@ -194,6 +200,8 @@ bool loadConfig(const std::string& path, Config& c, std::string& error, ConfigEx
     if (text.compare(0, 3, "\xEF\xBB\xBF") == 0) text.erase(0, 3);
 
     Config out;
+    bool hasRange = false;
+    double legacyJitter = 0;  // v1.2-v1.3 stored "up to +-N px" per axis
     size_t pos = 0;
     while (pos < text.size()) {
         size_t end = text.find('\n', pos);
@@ -211,11 +219,13 @@ bool loadConfig(const std::string& path, Config& c, std::string& error, ConfigEx
         else if (key == "key_fallback") out.keyFallback = parseBool(value);
         else if (key == "extra_keys") out.extraKeys = value;
         else if (key == "auto_start") out.autoStart = parseBool(value);
-        else if (key == "jitter_x") out.jitterX = std::max(0, std::atoi(value.c_str()));
+        else if (key == "jitter_min") out.jitterMin = parseNumber(value), hasRange = true;
+        else if (key == "jitter_max") out.jitterMax = parseNumber(value), hasRange = true;
+        else if (key == "jitter_x" || key == "jitter_y") legacyJitter = std::max(legacyJitter, parseNumber(value));
         else if (key == "hotkey") out.hotkey = value.empty() ? "off" : value;
-        else if (key == "jitter_y") out.jitterY = std::max(0, std::atoi(value.c_str()));
         else if (extras) (*extras)[key] = value;
     }
+    if (!hasRange && legacyJitter > 0) out.jitterMax = legacyJitter;
     c = out;
     return true;
 }

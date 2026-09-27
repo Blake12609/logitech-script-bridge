@@ -1,11 +1,18 @@
-// The window: a small custom-drawn dark UI on plain Win32 + GDI+.
-// App state is kept in LogitechScriptBridge.ini next to the exe (portable);
-// named configs can be saved/loaded anywhere (default: configs\ next to the exe).
+// The window: a custom-drawn dark UI on plain Win32 + GDI+ (no UI framework).
+//
+// Everything visible is painted by this file: a static "backdrop" (background,
+// cards, fields) is rendered once into a cached bitmap, owner-drawn controls copy
+// the piece of backdrop behind them and draw on top, and the window paints text,
+// the live mouse picture and animations over the backdrop.
+//
+// App state lives in LogitechScriptBridge.ini next to the exe (portable); named
+// configs can be saved/loaded anywhere (default: configs\ next to the exe).
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <dwmapi.h>
@@ -15,6 +22,7 @@
 #include <uxtheme.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <objidl.h>  // GDI+ needs COM declarations that WIN32_LEAN_AND_MEAN leaves out
@@ -36,24 +44,30 @@ using std::min;
 
 namespace {
 
+const wchar_t* const kVersion = L"v1.4";
+
 // ------------------------------------------------------------------ theme
 
 namespace Color {
-const COLORREF bg = RGB(0x15, 0x17, 0x1c);
-const COLORREF card = RGB(0x1e, 0x21, 0x28);
-const COLORREF field = RGB(0x27, 0x2b, 0x33);
-const COLORREF fieldHover = RGB(0x2f, 0x34, 0x3e);
-const COLORREF border = RGB(0x32, 0x37, 0x41);
-const COLORREF borderHover = RGB(0x46, 0x4d, 0x5a);
-const COLORREF text = RGB(0xe8, 0xea, 0xed);
-const COLORREF muted = RGB(0x8d, 0x93, 0x9e);
-const COLORREF accent = RGB(0x4f, 0x8c, 0xff);
-const COLORREF accentHover = RGB(0x6c, 0xa0, 0xff);
-const COLORREF danger = RGB(0xe5, 0x48, 0x4d);
-const COLORREF dangerHover = RGB(0xf0, 0x5f, 0x64);
-const COLORREF success = RGB(0x3f, 0xb9, 0x50);
-const COLORREF logBg = RGB(0x12, 0x14, 0x18);
+const COLORREF bgTop = RGB(0x12, 0x14, 0x1a);
+const COLORREF bgBottom = RGB(0x0c, 0x0d, 0x11);
+const COLORREF card = RGB(0x17, 0x1a, 0x21);
+const COLORREF cardBorder = RGB(0x24, 0x29, 0x33);
+const COLORREF field = RGB(0x1f, 0x23, 0x2c);
+const COLORREF fieldHover = RGB(0x27, 0x2c, 0x37);
+const COLORREF border = RGB(0x2e, 0x34, 0x40);
+const COLORREF borderHover = RGB(0x40, 0x48, 0x57);
+const COLORREF text = RGB(0xe9, 0xec, 0xf1);
+const COLORREF muted = RGB(0x8a, 0x93, 0xa3);
+const COLORREF faint = RGB(0x5a, 0x63, 0x71);
+const COLORREF accent = RGB(0x5b, 0x8c, 0xff);
+const COLORREF accent2 = RGB(0x8b, 0x5c, 0xf6);
+const COLORREF accentHover = RGB(0x7c, 0xa3, 0xff);
+const COLORREF success = RGB(0x34, 0xd3, 0x99);
+const COLORREF danger = RGB(0xf2, 0x5f, 0x5c);
+const COLORREF logBg = RGB(0x0f, 0x11, 0x15);
 const COLORREF white = RGB(0xff, 0xff, 0xff);
+const COLORREF black = RGB(0x00, 0x00, 0x00);
 }  // namespace Color
 
 COLORREF mix(COLORREF a, COLORREF b, double t) {
@@ -64,103 +78,264 @@ COLORREF mix(COLORREF a, COLORREF b, double t) {
     return ch(0) | ch(8) | ch(16);
 }
 
-Gdiplus::Color gp(COLORREF c) { return Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)); }
+Gdiplus::Color gp(COLORREF c, BYTE alpha = 255) { return Gdiplus::Color(alpha, GetRValue(c), GetGValue(c), GetBValue(c)); }
 
-void roundRect(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line = CLR_INVALID, int lineWidth = 1) {
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    const float x = static_cast<float>(r.left) + 0.5f, y = static_cast<float>(r.top) + 0.5f;
-    const float w = static_cast<float>(r.right - r.left) - 1.0f, h = static_cast<float>(r.bottom - r.top) - 1.0f;
-    const float d = std::min(static_cast<float>(radius * 2), std::min(w, h));
-    Gdiplus::GraphicsPath path;
-    path.AddArc(x, y, d, d, 180, 90);
-    path.AddArc(x + w - d, y, d, d, 270, 90);
-    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
-    path.AddArc(x, y + h - d, d, d, 90, 90);
-    path.CloseFigure();
-    if (fill != CLR_INVALID) {
-        Gdiplus::SolidBrush brush(gp(fill));
-        g.FillPath(&brush, &path);
+// GDI+ for shapes, GDI for crisp ClearType text. Everything is given in window
+// coordinates; ox/oy shift them so the same code can draw into a control's bitmap.
+struct Canvas {
+    HDC dc;
+    Gdiplus::Graphics g;
+    int ox, oy;
+    explicit Canvas(HDC d, int x = 0, int y = 0) : dc(d), g(d), ox(x), oy(y) {
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
     }
-    if (line != CLR_INVALID) {
-        Gdiplus::Pen pen(gp(line), static_cast<float>(lineWidth));
-        g.DrawPath(&pen, &path);
+    Gdiplus::RectF rf(const RECT& r, float inset = 0) const {
+        return Gdiplus::RectF(r.left - ox + inset, r.top - oy + inset, r.right - r.left - 2 * inset,
+                              r.bottom - r.top - 2 * inset);
+    }
+};
+
+void roundPath(Gdiplus::GraphicsPath& p, Gdiplus::RectF r, float rad) {
+    const float d = std::min(rad * 2, std::min(r.Width, r.Height));
+    if (d <= 0.5f) {
+        p.AddRectangle(r);
+        return;
+    }
+    p.AddArc(r.X, r.Y, d, d, 180, 90);
+    p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p.CloseFigure();
+}
+
+void fillRound(Canvas& c, const RECT& r, float rad, COLORREF col, BYTE alpha = 255) {
+    Gdiplus::GraphicsPath p;
+    roundPath(p, c.rf(r), rad);
+    Gdiplus::SolidBrush b(gp(col, alpha));
+    c.g.FillPath(&b, &p);
+}
+
+void strokeRound(Canvas& c, const RECT& r, float rad, COLORREF col, float w = 1, BYTE alpha = 255) {
+    Gdiplus::GraphicsPath p;
+    roundPath(p, c.rf(r, w / 2), rad);
+    Gdiplus::Pen pen(gp(col, alpha), w);
+    c.g.DrawPath(&pen, &p);
+}
+
+void gradientRound(Canvas& c, const RECT& r, float rad, COLORREF a, COLORREF b, float angle, BYTE alpha = 255) {
+    Gdiplus::GraphicsPath p;
+    roundPath(p, c.rf(r), rad);
+    Gdiplus::RectF box = c.rf(r);
+    box.Inflate(1, 1);
+    Gdiplus::LinearGradientBrush br(box, gp(a, alpha), gp(b, alpha), angle);
+    c.g.FillPath(&br, &p);
+}
+
+void softShadow(Canvas& c, const RECT& r, float rad, int size) {
+    for (int i = size; i >= 1; i--) {
+        RECT s = r;
+        InflateRect(&s, i, i);
+        OffsetRect(&s, 0, i / 2 + 1);
+        fillRound(c, s, rad + i, Color::black, static_cast<BYTE>(26 / (1 + i)));
     }
 }
 
-void polygon(HDC dc, const std::vector<Gdiplus::PointF>& pts, COLORREF fill) {
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    Gdiplus::SolidBrush brush(gp(fill));
-    g.FillPolygon(&brush, pts.data(), static_cast<INT>(pts.size()));
+void glow(Canvas& c, float cx, float cy, float radius, COLORREF col, BYTE alpha) {
+    Gdiplus::GraphicsPath p;
+    p.AddEllipse(cx - radius - c.ox, cy - radius - c.oy, radius * 2, radius * 2);
+    Gdiplus::PathGradientBrush br(&p);
+    br.SetCenterColor(gp(col, alpha));
+    Gdiplus::Color edge = gp(col, 0);
+    INT n = 1;
+    br.SetSurroundColors(&edge, &n);
+    c.g.FillPath(&br, &p);
 }
 
-void chevron(HDC dc, int cx, int cy, int size, float stroke, COLORREF c) {
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-    Gdiplus::Pen pen(gp(c), stroke);
-    pen.SetStartCap(Gdiplus::LineCapRound);
-    pen.SetEndCap(Gdiplus::LineCapRound);
-    const float s = size / 2.0f;
-    Gdiplus::PointF pts[] = {{cx - s, cy - s / 4}, {static_cast<float>(cx), cy + s / 2}, {cx + s, cy - s / 4}};
-    g.DrawLines(&pen, pts, 3);
+void text(Canvas& c, const std::wstring& s, RECT r, HFONT font, COLORREF col, UINT flags = DT_LEFT | DT_VCENTER,
+          int tracking = 0) {
+    c.g.Flush(Gdiplus::FlushIntentionSync);
+    OffsetRect(&r, -c.ox, -c.oy);
+    SelectObject(c.dc, font);
+    SetTextColor(c.dc, col);
+    SetBkMode(c.dc, TRANSPARENT);
+    SetTextCharacterExtra(c.dc, tracking);
+    if (!(flags & DT_WORDBREAK)) flags |= DT_SINGLELINE | DT_END_ELLIPSIS;
+    DrawTextW(c.dc, s.c_str(), -1, &r, flags | DT_NOPREFIX);
+    SetTextCharacterExtra(c.dc, 0);
 }
 
-void circle(HDC dc, float cx, float cy, float r, COLORREF c) {
-    Gdiplus::Graphics g(dc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    Gdiplus::SolidBrush brush(gp(c));
-    g.FillEllipse(&brush, cx - r, cy - r, r * 2, r * 2);
-}
-
-void text(HDC dc, const std::wstring& s, RECT r, HFONT font, COLORREF c, UINT flags = DT_LEFT | DT_VCENTER) {
-    SelectObject(dc, font);
-    SetTextColor(dc, c);
-    SetBkMode(dc, TRANSPARENT);
-    DrawTextW(dc, s.c_str(), -1, &r, flags | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-}
-
-int textWidth(HDC dc, const std::wstring& s, HFONT font) {
+int textWidth(HDC dc, const std::wstring& s, HFONT font, int tracking = 0) {
     SelectObject(dc, font);
     SIZE sz{};
     GetTextExtentPoint32W(dc, s.c_str(), static_cast<int>(s.size()), &sz);
-    return sz.cx;
+    return sz.cx + tracking * static_cast<int>(s.size());
+}
+
+// ------------------------------------------------------------------ icons
+
+enum class Icon {
+    None, Play, Stop, Folder, Save, Upload, Edit, Reload, List, Chevron, Check, Close, Minimize, Maximize,
+    Restore, Trash, Pointer, Info,
+};
+
+void drawIcon(Canvas& c, Icon ic, const RECT& box, COLORREF col, float stroke) {
+    const float s = static_cast<float>(std::min(box.right - box.left, box.bottom - box.top));
+    const float x0 = box.left - c.ox + (box.right - box.left - s) / 2, y0 = box.top - c.oy + (box.bottom - box.top - s) / 2;
+    auto P = [&](float fx, float fy) { return Gdiplus::PointF(x0 + fx * s, y0 + fy * s); };
+    Gdiplus::Pen pen(gp(col), stroke);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    Gdiplus::SolidBrush brush(gp(col));
+    auto lines = [&](std::vector<Gdiplus::PointF> v, bool closed = false) {
+        if (closed) c.g.DrawPolygon(&pen, v.data(), static_cast<INT>(v.size()));
+        else c.g.DrawLines(&pen, v.data(), static_cast<INT>(v.size()));
+    };
+    auto rect = [&](float l, float t, float r, float b, float rad) {
+        Gdiplus::GraphicsPath p;
+        roundPath(p, Gdiplus::RectF(x0 + l * s, y0 + t * s, (r - l) * s, (b - t) * s), rad * s);
+        c.g.DrawPath(&pen, &p);
+    };
+    switch (ic) {
+        case Icon::Play: {
+            Gdiplus::PointF v[] = {P(0.32f, 0.2f), P(0.8f, 0.5f), P(0.32f, 0.8f)};
+            c.g.FillPolygon(&brush, v, 3);
+            c.g.DrawPolygon(&pen, v, 3);
+            break;
+        }
+        case Icon::Stop: {
+            Gdiplus::GraphicsPath p;
+            roundPath(p, Gdiplus::RectF(x0 + 0.26f * s, y0 + 0.26f * s, 0.48f * s, 0.48f * s), 0.08f * s);
+            c.g.FillPath(&brush, &p);
+            break;
+        }
+        case Icon::Folder:
+            lines({P(0.12f, 0.26f), P(0.4f, 0.26f), P(0.48f, 0.35f), P(0.88f, 0.35f), P(0.88f, 0.78f), P(0.12f, 0.78f)}, true);
+            break;
+        case Icon::Save:
+            rect(0.16f, 0.16f, 0.84f, 0.84f, 0.1f);
+            lines({P(0.32f, 0.16f), P(0.32f, 0.36f), P(0.62f, 0.36f), P(0.62f, 0.16f)});
+            rect(0.3f, 0.56f, 0.7f, 0.84f, 0.02f);
+            break;
+        case Icon::Upload:
+            lines({P(0.16f, 0.6f), P(0.16f, 0.84f), P(0.84f, 0.84f), P(0.84f, 0.6f)});
+            lines({P(0.5f, 0.66f), P(0.5f, 0.16f)});
+            lines({P(0.32f, 0.34f), P(0.5f, 0.16f), P(0.68f, 0.34f)});
+            break;
+        case Icon::Edit:
+            lines({P(0.64f, 0.18f), P(0.82f, 0.36f), P(0.38f, 0.8f), P(0.18f, 0.82f), P(0.2f, 0.62f)}, true);
+            lines({P(0.54f, 0.28f), P(0.72f, 0.46f)});
+            break;
+        case Icon::Reload:
+            c.g.DrawArc(&pen, x0 + 0.2f * s, y0 + 0.2f * s, 0.6f * s, 0.6f * s, -30, 290);
+            lines({P(0.62f, 0.2f), P(0.78f, 0.35f), P(0.84f, 0.14f)});
+            break;
+        case Icon::List:
+            for (float y : {0.3f, 0.5f, 0.7f}) {
+                lines({P(0.38f, y), P(0.84f, y)});
+                c.g.FillEllipse(&brush, x0 + 0.16f * s, y0 + (y - 0.05f) * s, 0.1f * s, 0.1f * s);
+            }
+            break;
+        case Icon::Chevron:
+            lines({P(0.3f, 0.4f), P(0.5f, 0.6f), P(0.7f, 0.4f)});
+            break;
+        case Icon::Check:
+            lines({P(0.2f, 0.52f), P(0.42f, 0.74f), P(0.8f, 0.3f)});
+            break;
+        case Icon::Close:
+            lines({P(0.3f, 0.3f), P(0.7f, 0.7f)});
+            lines({P(0.7f, 0.3f), P(0.3f, 0.7f)});
+            break;
+        case Icon::Minimize:
+            lines({P(0.3f, 0.5f), P(0.7f, 0.5f)});
+            break;
+        case Icon::Maximize:
+            rect(0.3f, 0.3f, 0.7f, 0.7f, 0.04f);
+            break;
+        case Icon::Restore:
+            rect(0.3f, 0.38f, 0.62f, 0.7f, 0.04f);
+            lines({P(0.38f, 0.3f), P(0.7f, 0.3f), P(0.7f, 0.62f)});
+            break;
+        case Icon::Trash:
+            lines({P(0.18f, 0.28f), P(0.82f, 0.28f)});
+            lines({P(0.4f, 0.28f), P(0.42f, 0.16f), P(0.58f, 0.16f), P(0.6f, 0.28f)});
+            lines({P(0.27f, 0.28f), P(0.32f, 0.84f), P(0.68f, 0.84f), P(0.73f, 0.28f)});
+            break;
+        case Icon::Pointer:
+            lines({P(0.28f, 0.16f), P(0.28f, 0.78f), P(0.43f, 0.64f), P(0.54f, 0.86f), P(0.63f, 0.82f), P(0.52f, 0.6f),
+                   P(0.72f, 0.6f)}, true);
+            break;
+        case Icon::Info:
+            c.g.DrawEllipse(&pen, x0 + 0.12f * s, y0 + 0.12f * s, 0.76f * s, 0.76f * s);
+            lines({P(0.5f, 0.46f), P(0.5f, 0.68f)});
+            c.g.FillEllipse(&brush, x0 + 0.45f * s, y0 + 0.28f * s, 0.1f * s, 0.1f * s);
+            break;
+        case Icon::None:
+            break;
+    }
+}
+
+// App logo: gradient tile with a mouse outline.
+void drawLogo(Canvas& c, const RECT& box) {
+    gradientRound(c, box, (box.right - box.left) * 0.28f, Color::accent, Color::accent2, 45);
+    const float s = static_cast<float>(box.right - box.left);
+    Gdiplus::Pen pen(gp(Color::white), std::max(1.2f, s / 14));
+    const float x = box.left - c.ox + s * 0.33f, y = box.top - c.oy + s * 0.2f, w = s * 0.34f, h = s * 0.6f;
+    Gdiplus::GraphicsPath p;
+    roundPath(p, Gdiplus::RectF(x, y, w, h), w / 2);
+    c.g.DrawPath(&pen, &p);
+    c.g.DrawLine(&pen, x + w / 2, y + h * 0.12f, x + w / 2, y + h * 0.34f);
 }
 
 // ------------------------------------------------------------------ controls
 
 enum Id {
-    IDC_START = 100, IDC_STOP, IDC_OPEN, IDC_LOADCFG, IDC_SAVECFG, IDC_SAVEAS, IDC_RELOAD, IDC_EDIT,
-    IDC_SCRIPT, IDC_SCRIPT_MENU, IDC_BROWSE, IDC_DEVICE, IDC_PORT, IDC_PORT_MENU, IDC_BAUD, IDC_TEST,
-    IDC_KEYFALLBACK, IDC_EXTRA, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y, IDC_HOTKEY, IDC_CLEAR, IDC_LOG,
+    IDC_START = 100, IDC_OPEN, IDC_LIBRARY, IDC_EDIT, IDC_RELOAD, IDC_CONFIG, IDC_MIN, IDC_MAX, IDC_CLOSE,
+    IDC_DEVICE, IDC_PORT, IDC_PORT_MENU, IDC_BAUD, IDC_TEST, IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_EXTRA, IDC_HOTKEY,
+    IDC_JITTER_MIN, IDC_JITTER_MAX, IDC_CLEAR, IDC_LOG,
+    // commands without a control of their own (shortcuts and menus)
+    IDC_STOP = 200, IDC_SAVECFG, IDC_SAVEAS, IDC_LOADCFG,
 };
 
-enum class Role { Primary, Danger, Secondary, Dropdown, Chevron, Toggle };
+enum class Role { Hero, Ghost, Secondary, Dropdown, Chevron, Toggle, Caption, CaptionClose, Chip };
+
+struct ButtonInfo {
+    Role role;
+    Icon icon;
+};
 
 const UINT WM_APP_CLEARLOG = WM_APP + 1;
-const UINT_PTR kLogTimer = 1;
+const UINT_PTR kLogTimer = 1, kAnimTimer = 2;
+const int kHotkeyId = 1;
 
 const char* const kExtraKeys[] = {"off", "mouse", "gkeys"};
 const wchar_t* const kExtraLabels[] = {L"Off", L"Mouse buttons 6–17", L"G-keys G1–G12"};
 
-// global start/stop key
 const struct { const char* key; const wchar_t* label; UINT vk; } kHotkeys[] = {
-    {"off", L"Off", 0},        {"f6", L"F6", VK_F6},   {"f7", L"F7", VK_F7},        {"f8", L"F8", VK_F8},
-    {"f9", L"F9", VK_F9},      {"f10", L"F10", VK_F10}, {"f11", L"F11", VK_F11},    {"f12", L"F12", VK_F12},
+    {"off", L"Off", 0},          {"f6", L"F6", VK_F6},    {"f7", L"F7", VK_F7},     {"f8", L"F8", VK_F8},
+    {"f9", L"F9", VK_F9},        {"f10", L"F10", VK_F10}, {"f11", L"F11", VK_F11}, {"f12", L"F12", VK_F12},
     {"pause", L"Pause", VK_PAUSE}, {"scrolllock", L"Scroll Lock", VK_SCROLL},
 };
 const int kHotkeyCount = sizeof(kHotkeys) / sizeof(kHotkeys[0]);
-const int kHotkeyId = 1;
 
-// log line colours
+// A longer explanation per device, shown in the device card.
+const wchar_t* const kDeviceHelp[kDeviceCount] = {
+    L"Mouse only. Keys the script presses can be typed by Windows instead (see Options). Pick its COM port and press Test.",
+    L"Mouse only. Keys the script presses can be typed by Windows instead (see Options). Pick its COM port and press Test.",
+    L"Mouse and keyboard. Flash firmware/esp32s3_bridge, plug in the board's USB port, pick its COM port and press Test.",
+    L"Mouse and keyboard. Flash firmware/arduino_hid_bridge, pick its COM port and press Test. Back/forward need an RP2040 board.",
+    L"No hardware: Windows SendInput. Handy for trying scripts, but many games ignore injected input.",
+    L"Nothing is sent. Every click, move and key the script makes is written to the log instead.",
+};
+
 enum class LogKind { Script, Info, Error, Dry };
 COLORREF logColor(LogKind k) {
     switch (k) {
-        case LogKind::Info: return RGB(0x8d, 0x93, 0x9e);
+        case LogKind::Info: return RGB(0x86, 0x8f, 0x9e);
         case LogKind::Error: return RGB(0xff, 0x7b, 0x72);
-        case LogKind::Dry: return RGB(0x79, 0xa8, 0xff);
-        default: return RGB(0xe8, 0xea, 0xed);
+        case LogKind::Dry: return RGB(0x7c, 0xa8, 0xff);
+        default: return RGB(0xe6, 0xe9, 0xee);
     }
 }
 
@@ -180,6 +355,12 @@ std::string narrow(const std::wstring& w) {
     return s;
 }
 
+std::wstring formatPx(double v) {
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%g", v);
+    return buf;
+}
+
 struct Card {
     RECT rect;
     std::wstring caption;
@@ -190,18 +371,23 @@ struct Label {
     std::wstring text;
 };
 
+struct ToggleAnim {
+    float from, to;
+    DWORD start;
+};
+
 struct App {
     HWND wnd = nullptr;
     int dpi = 96;
-    HFONT font = nullptr, fontBold = nullptr, fontSmall = nullptr, fontTitle = nullptr, fontMono = nullptr;
-    HBRUSH fieldBrush = nullptr, logBrush = nullptr;
+    HFONT font = nullptr, fontBold = nullptr, fontSmall = nullptr, fontCaption = nullptr, fontTitle = nullptr,
+          fontHero = nullptr, fontTiny = nullptr, fontMono = nullptr;
+    HBRUSH fieldBrush = nullptr;
+    std::wstring monoFace = L"Consolas";
 
-    std::string exeDir, statePath, configPath;
+    std::string exeDir, statePath, configPath, scriptPath;
     Config savedConfig;  // contents of configPath, to show "unsaved changes"
     int device = 0, extraKeys = 0, hotkey = 0;
-    bool hotkeyRegistered = false;
-    unsigned lastButtons = ~0u;  // indicator state last painted
-    bool keyFallback = true, autoStart = false;
+    bool keyFallback = true, autoStart = false, hotkeyRegistered = false;
     enum class Status { Stopped, Running, Error } status = Status::Stopped;
 
     WinInput input;
@@ -211,16 +397,26 @@ struct App {
     std::mutex logMu;
     std::vector<std::pair<LogKind, std::string>> pendingLog;
 
-    std::map<int, Role> roles;
-    std::map<int, RECT> fields;  // painted field boxes around edits (by edit id)
+    std::map<int, ButtonInfo> buttons;
+    std::map<int, RECT> fields;  // painted boxes around edit controls (by edit id)
+    std::map<int, ToggleAnim> anims;
     std::vector<Card> cards;
     std::vector<Label> labels;
-    RECT header{}, hintRect{}, pillRect{}, buttonsRect{};
+    int titleH = 44;
+    RECT heroRect{}, ringRect{}, bigLabelRect{}, helpRect{}, mouseCard{}, mouseArea{}, legendRect{};
     HWND hover = nullptr, tooltip = nullptr;
     HACCEL accel = nullptr;
+    unsigned lastButtons = ~0u;
+
+    // cached backdrop
+    HDC backdropDC = nullptr;
+    HBITMAP backdropBmp = nullptr;
+    SIZE backdropSize{};
+    bool backdropDirty = true;
 
     HWND item(int id) const { return GetDlgItem(wnd, id); }
     int S(int v) const { return MulDiv(v, dpi, 96); }
+    float Sf(float v) const { return v * dpi / 96.0f; }
     bool running() const { return engine != nullptr; }
     void log(const std::string& s, LogKind kind = LogKind::Info) {
         std::lock_guard<std::mutex> lock(logMu);
@@ -236,25 +432,41 @@ std::wstring getText(int id) {
     return s;
 }
 
+RECT clientRectOf(int id) {
+    RECT r{};
+    if (!GetWindowRect(app.item(id), &r)) return r;
+    MapWindowPoints(nullptr, app.wnd, reinterpret_cast<POINT*>(&r), 2);
+    return r;
+}
+
+void redrawAll() {
+    app.backdropDirty = true;
+    RedrawWindow(app.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
 // ------------------------------------------------------------------ config <-> UI
+
+void refreshChrome();
+
+double readPx(int id) {
+    const double v = _wtof(getText(id).c_str());
+    return std::isfinite(v) && v > 0 ? std::min(v, 100.0) : 0.0;
+}
 
 Config currentConfig() {
     Config c;
-    c.script = narrow(getText(IDC_SCRIPT));
+    c.script = app.scriptPath;
     c.device = kDevices[app.device].key;
     c.port = narrow(getText(IDC_PORT));
-    c.baud = std::max(1, _wtoi(getText(IDC_BAUD).c_str()));
-    if (getText(IDC_BAUD).empty()) c.baud = 115200;
+    c.baud = getText(IDC_BAUD).empty() ? 115200 : std::max(1, _wtoi(getText(IDC_BAUD).c_str()));
     c.keyFallback = app.keyFallback;
     c.extraKeys = kExtraKeys[app.extraKeys];
     c.autoStart = app.autoStart;
-    c.jitterX = std::max(0, _wtoi(getText(IDC_JITTER_X).c_str()));
-    c.jitterY = std::max(0, _wtoi(getText(IDC_JITTER_Y).c_str()));
+    c.jitterMin = readPx(IDC_JITTER_MIN);
+    c.jitterMax = readPx(IDC_JITTER_MAX);
     c.hotkey = kHotkeys[app.hotkey].key;
     return c;
 }
-
-void refreshChrome();
 
 void registerHotkey() {
     if (app.hotkeyRegistered) UnregisterHotKey(app.wnd, kHotkeyId);
@@ -269,16 +481,21 @@ void registerHotkey() {
                 LogKind::Error);
 }
 
+void setScript(const std::string& path) {
+    app.scriptPath = path;
+    refreshChrome();
+}
+
 void applyConfig(const Config& c) {
-    SetWindowTextW(app.item(IDC_SCRIPT), widen(c.script).c_str());
+    app.scriptPath = c.script;
     const DeviceInfo* d = findDevice(c.device);
     app.device = d ? static_cast<int>(d - kDevices) : 0;
     SetWindowTextW(app.item(IDC_PORT), widen(c.port).c_str());
     SetWindowTextW(app.item(IDC_BAUD), std::to_wstring(c.baud).c_str());
     app.keyFallback = c.keyFallback;
     app.autoStart = c.autoStart;
-    SetWindowTextW(app.item(IDC_JITTER_X), std::to_wstring(c.jitterX).c_str());
-    SetWindowTextW(app.item(IDC_JITTER_Y), std::to_wstring(c.jitterY).c_str());
+    SetWindowTextW(app.item(IDC_JITTER_MIN), formatPx(c.jitterMin).c_str());
+    SetWindowTextW(app.item(IDC_JITTER_MAX), formatPx(c.jitterMax).c_str());
     app.extraKeys = 0;
     for (int i = 0; i < 3; i++)
         if (c.extraKeys == kExtraKeys[i]) app.extraKeys = i;
@@ -287,7 +504,7 @@ void applyConfig(const Config& c) {
         if (c.hotkey == kHotkeys[i].key) app.hotkey = i;
     registerHotkey();
     for (int id : {IDC_DEVICE, IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_EXTRA, IDC_HOTKEY})
-        InvalidateRect(app.item(id), nullptr, TRUE);
+        InvalidateRect(app.item(id), nullptr, FALSE);
     refreshChrome();
 }
 
@@ -306,25 +523,28 @@ void saveState() {
 
 bool modified() { return !app.configPath.empty() && currentConfig() != app.savedConfig; }
 
-// Title, subtitle, device hint and enabled states follow the current values.
+void setStatus(App::Status s) {
+    if (app.status == s) return;
+    app.status = s;
+    redrawAll();  // hero border and glow follow the status
+}
+
+// Title, texts and enabled states follow the current values.
 void refreshChrome() {
     std::wstring title = L"Logitech Script Bridge";
     if (!app.configPath.empty()) title += L" – " + widen(fileName(app.configPath)) + (modified() ? L"*" : L"");
     SetWindowTextW(app.wnd, title.c_str());
 
     const bool run = app.running(), serial = kDevices[app.device].serial;
-    EnableWindow(app.item(IDC_START), !run);
-    EnableWindow(app.item(IDC_STOP), run);
     EnableWindow(app.item(IDC_RELOAD), run);
-    for (int id : {IDC_SCRIPT, IDC_SCRIPT_MENU, IDC_BROWSE, IDC_OPEN, IDC_LOADCFG, IDC_DEVICE, IDC_EXTRA,
-                   IDC_KEYFALLBACK, IDC_AUTOSTART, IDC_JITTER_X, IDC_JITTER_Y, IDC_HOTKEY})
+    for (int id : {IDC_OPEN, IDC_LIBRARY, IDC_DEVICE, IDC_EXTRA, IDC_AUTOSTART, IDC_JITTER_MIN, IDC_JITTER_MAX,
+                   IDC_HOTKEY, IDC_TEST})
         EnableWindow(app.item(id), !run);
     for (int id : {IDC_PORT, IDC_PORT_MENU, IDC_BAUD}) EnableWindow(app.item(id), !run && serial);
-    EnableWindow(app.item(IDC_TEST), !run);
     EnableWindow(app.item(IDC_KEYFALLBACK), !run && !kDevices[app.device].keyboard);
-    InvalidateRect(app.wnd, &app.header, FALSE);
-    InvalidateRect(app.wnd, &app.hintRect, FALSE);
-    for (auto& f : app.fields) InvalidateRect(app.wnd, &f.second, FALSE);
+    InvalidateRect(app.wnd, &app.heroRect, FALSE);
+    InvalidateRect(app.wnd, &app.helpRect, FALSE);
+    for (int id : {IDC_CONFIG, IDC_START, IDC_DEVICE}) InvalidateRect(app.item(id), nullptr, FALSE);
 }
 
 // ------------------------------------------------------------------ log
@@ -360,6 +580,11 @@ void flushLog() {
     SendMessageW(box, WM_VSCROLL, SB_BOTTOM, 0);
 }
 
+void clearLog() {
+    flushLog();
+    SetWindowTextW(app.item(IDC_LOG), L"");
+}
+
 // Engine messages share the script's log callback; tell them apart by their wording.
 LogKind engineLogKind(const std::string& s) {
     if (s.rfind("Script error", 0) == 0 || s.rfind("Unknown ", 0) == 0) return LogKind::Error;
@@ -369,14 +594,204 @@ LogKind engineLogKind(const std::string& s) {
     return LogKind::Script;
 }
 
-void clearLog() {
-    flushLog();
-    SetWindowTextW(app.item(IDC_LOG), L"");
-}
-
 void dryRunLog(void*, const std::string& s) { app.log(s, LogKind::Dry); }
 
-// ------------------------------------------------------------------ dialogs & menus
+// ------------------------------------------------------------------ dropdown lists
+
+// A dark popup list that replaces native menus: returns the chosen index or -1.
+// Items may carry a right-aligned hint after a tab ("Save\tCtrl+S"); "" is a separator.
+struct Popup {
+    std::vector<std::wstring> items;
+    std::vector<bool> enabled;
+    std::vector<RECT> rects;
+    int checked = -1, hover = -1, result = -1;
+    bool done = false;
+} *g_popup = nullptr;
+
+int popupItemAt(POINT p) {
+    for (size_t i = 0; i < g_popup->rects.size(); i++)
+        if (!g_popup->items[i].empty() && g_popup->enabled[i] && PtInRect(&g_popup->rects[i], p))
+            return static_cast<int>(i);
+    return -1;
+}
+
+void popupPaint(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC target = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    HDC dc = CreateCompatibleDC(target);
+    HBITMAP bmp = CreateCompatibleBitmap(target, rc.right, rc.bottom);
+    HGDIOBJ old = SelectObject(dc, bmp);
+    {
+        Canvas c(dc);
+        HBRUSH bg = CreateSolidBrush(RGB(0x1b, 0x1f, 0x27));
+        FillRect(dc, &rc, bg);
+        DeleteObject(bg);
+        strokeRound(c, rc, 0, Color::borderHover);
+        for (size_t i = 0; i < g_popup->items.size(); i++) {
+            const RECT& r = g_popup->rects[i];
+            const std::wstring& item = g_popup->items[i];
+            if (item.empty()) {
+                RECT line = {r.left + app.S(10), (r.top + r.bottom) / 2, r.right - app.S(10), (r.top + r.bottom) / 2 + 1};
+                fillRound(c, line, 0, Color::border);
+                continue;
+            }
+            if (static_cast<int>(i) == g_popup->hover) {
+                RECT h = {r.left + app.S(5), r.top + app.S(1), r.right - app.S(5), r.bottom - app.S(1)};
+                fillRound(c, h, app.Sf(6), Color::fieldHover);
+            }
+            const bool on = g_popup->enabled[i];
+            if (static_cast<int>(i) == g_popup->checked) {
+                RECT ib = {r.left + app.S(12), r.top + app.S(9), r.left + app.S(26), r.bottom - app.S(9)};
+                drawIcon(c, Icon::Check, ib, Color::accent, app.Sf(1.8f));
+            }
+            const size_t tab = item.find(L'\t');
+            RECT tr = {r.left + app.S(34), r.top, r.right - app.S(14), r.bottom};
+            text(c, item.substr(0, tab), tr, app.font, on ? Color::text : Color::faint);
+            if (tab != std::wstring::npos)
+                text(c, item.substr(tab + 1), tr, app.fontSmall, on ? Color::muted : Color::faint, DT_RIGHT | DT_VCENTER);
+        }
+    }
+    BitBlt(target, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (!g_popup) return DefWindowProcW(hwnd, msg, wp, lp);
+    POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    switch (msg) {
+        case WM_PAINT:
+            popupPaint(hwnd);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_MOUSEMOVE: {
+            const int h = popupItemAt(p);
+            if (h != g_popup->hover) {
+                g_popup->hover = h;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+            if (!PtInRect(&rc, p)) g_popup->done = true;  // click outside closes
+            return 0;
+        case WM_LBUTTONUP: {
+            const int i = popupItemAt(p);
+            if (i >= 0) {
+                g_popup->result = i;
+                g_popup->done = true;
+            }
+            return 0;
+        }
+        case WM_KEYDOWN: {
+            const int n = static_cast<int>(g_popup->items.size());
+            if (wp == VK_ESCAPE) g_popup->done = true;
+            if (wp == VK_RETURN && g_popup->hover >= 0) {
+                g_popup->result = g_popup->hover;
+                g_popup->done = true;
+            }
+            if (wp == VK_DOWN || wp == VK_UP) {
+                const int step = wp == VK_DOWN ? 1 : -1;
+                int i = g_popup->hover;
+                for (int tries = 0; tries < n; tries++) {
+                    i = (i + step + n) % n;
+                    if (!g_popup->items[i].empty() && g_popup->enabled[i]) break;
+                }
+                g_popup->hover = i;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_CAPTURECHANGED:
+            if (reinterpret_cast<HWND>(lp) != hwnd) g_popup->done = true;
+            return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(wp) == WA_INACTIVE) g_popup->done = true;
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+int popupList(const RECT& anchor, const std::vector<std::wstring>& items, int checked,
+              const std::vector<bool>& enabled = {}) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = {sizeof(wc)};
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = popupProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"LSBPopup";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    Popup st;
+    st.items = items;
+    st.enabled = enabled.size() == items.size() ? enabled : std::vector<bool>(items.size(), true);
+    st.checked = checked;
+
+    // size: widest item or the anchor, whichever is wider
+    HDC dc = GetDC(app.wnd);
+    int width = anchor.right - anchor.left, y = app.S(5);
+    for (size_t i = 0; i < items.size(); i++) {
+        const int h = items[i].empty() ? app.S(9) : app.S(32);
+        st.rects.push_back({0, y, 0, y + h});
+        y += h;
+        const size_t tab = items[i].find(L'\t');
+        int w = textWidth(dc, items[i].substr(0, tab), app.font) + app.S(60);
+        if (tab != std::wstring::npos) w += textWidth(dc, items[i].substr(tab + 1), app.fontSmall) + app.S(24);
+        width = std::max(width, w);
+    }
+    ReleaseDC(app.wnd, dc);
+    const int height = y + app.S(5);
+    for (auto& r : st.rects) r.right = width;
+
+    // place below the anchor, or above it if there's no room
+    POINT pos = {anchor.left, anchor.bottom + app.S(4)};
+    ClientToScreen(app.wnd, &pos);
+    MONITORINFO mi = {sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(app.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    if (pos.y + height > mi.rcWork.bottom) {
+        POINT top = {anchor.left, anchor.top - app.S(4) - height};
+        ClientToScreen(app.wnd, &top);
+        pos.y = top.y;
+    }
+    pos.x = std::min(pos.x, static_cast<LONG>(mi.rcWork.right - width));
+
+    g_popup = &st;
+    HWND pw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"LSBPopup", L"", WS_POPUP, pos.x, pos.y, width, height,
+                              app.wnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    const int corner = 3;  // DWMWCP_ROUNDSMALL on Windows 11
+    DwmSetWindowAttribute(pw, 33, &corner, sizeof(corner));
+    ShowWindow(pw, SW_SHOW);
+    SetFocus(pw);
+    SetCapture(pw);
+    MSG msg;
+    while (!st.done) {
+        const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+        if (r <= 0) {
+            if (r == 0) PostQuitMessage(static_cast<int>(msg.wParam));
+            break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (GetCapture() == pw) ReleaseCapture();
+    g_popup = nullptr;
+    DestroyWindow(pw);
+    SetForegroundWindow(app.wnd);
+    return st.result;
+}
+
+// ------------------------------------------------------------------ dialogs
 
 void errorBox(const std::wstring& title, const std::string& msg) {
     MessageBoxW(app.wnd, widen(msg).c_str(), title.c_str(), MB_ICONERROR | MB_OK);
@@ -404,35 +819,6 @@ std::string fileDialog(bool save, const wchar_t* filter, const std::string& init
     ofn.Flags = save ? OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST : OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     const BOOL ok = save ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn);
     return ok ? narrow(file) : std::string();
-}
-
-// Pops up a menu under `anchor` (a control or a field box) and returns the chosen index or -1.
-int popupMenu(const RECT& anchorClient, const std::vector<std::wstring>& items, int checked,
-              const std::vector<bool>* enabled = nullptr) {
-    HMENU menu = CreatePopupMenu();
-    for (size_t i = 0; i < items.size(); i++) {
-        if (items[i].empty()) {
-            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            continue;
-        }
-        UINT flags = MF_STRING;
-        if (static_cast<int>(i) == checked) flags |= MF_CHECKED;
-        if (enabled && !(*enabled)[i]) flags |= MF_GRAYED;
-        AppendMenuW(menu, flags, i + 1, items[i].c_str());
-    }
-    POINT pt = {anchorClient.left, anchorClient.bottom + app.S(4)};
-    ClientToScreen(app.wnd, &pt);
-    const int cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, pt.x, pt.y,
-                                     app.wnd, nullptr);
-    DestroyMenu(menu);
-    return cmd - 1;
-}
-
-RECT clientRectOf(int id) {
-    RECT r{};
-    if (!GetWindowRect(app.item(id), &r)) return r;
-    MapWindowPoints(nullptr, app.wnd, reinterpret_cast<POINT*>(&r), 2);
-    return r;
 }
 
 std::vector<std::string> listLua(const std::string& dir) {
@@ -463,7 +849,7 @@ void stopScript() {
     app.engine.reset();
     closeDevices();
     flushLog();
-    if (app.status == App::Status::Running) app.status = App::Status::Stopped;
+    if (app.status == App::Status::Running) setStatus(App::Status::Stopped);
     refreshChrome();
 }
 
@@ -506,17 +892,17 @@ void startScript() {
     }
     if (!app.backend->supportsKeyboard() && c.keyFallback) app.fallback = createSoftwareBackend();
 
-    app.engine = std::make_unique<Engine>(*app.backend, app.input, [](const std::string& s) { app.log(s, engineLogKind(s)); },
-                                          app.fallback.get());
+    app.engine = std::make_unique<Engine>(*app.backend, app.input,
+                                          [](const std::string& s) { app.log(s, engineLogKind(s)); }, app.fallback.get());
     app.engine->onClearLog = [] { PostMessageW(app.wnd, WM_APP_CLEARLOG, 0, 0); };
-    app.engine->setJitter(c.jitterX, c.jitterY);
+    app.engine->setJitter(c.jitterMin, c.jitterMax);
 
     app.log(std::string("\nStarting ") + fileName(c.script) + " on " + info.label + "\n");
     if (!app.engine->start(source, fileName(c.script), err)) {
         app.engine.reset();
         closeDevices();
         app.log("Could not load script:\n" + err + "\n", LogKind::Error);
-        app.status = App::Status::Error;
+        setStatus(App::Status::Error);
         flushLog();
         refreshChrome();
         return;
@@ -526,12 +912,12 @@ void startScript() {
         errorBox(L"Input", err);
         return;
     }
-    if (c.jitterX || c.jitterY)
-        app.log("Randomizing mouse movement by up to \u00B1" + std::to_string(c.jitterX) + " px X / \u00B1" +
-                std::to_string(c.jitterY) + " px Y.\n");
+    if (c.jitterMax > 0)
+        app.log("Randomizing mouse movement: " + narrow(formatPx(std::min(c.jitterMin, c.jitterMax))) + "–" +
+                narrow(formatPx(std::max(c.jitterMin, c.jitterMax))) + " px off the exact path.\n");
     if (c.extraKeys == "mouse") app.log("F13–F24 act as mouse buttons 6–17.\n");
     if (c.extraKeys == "gkeys") app.log("F13–F24 act as G-keys G1–G12.\n");
-    app.status = App::Status::Running;
+    setStatus(App::Status::Running);
     refreshChrome();
 }
 
@@ -570,13 +956,12 @@ void loadConfigFile(const std::string& path) {
 }
 
 void saveConfigAs() {
-    std::string name = app.configPath.empty() ? fileName(narrow(getText(IDC_SCRIPT))) : fileName(app.configPath);
+    std::string name = app.configPath.empty() ? fileName(app.scriptPath) : fileName(app.configPath);
     if (name.size() > 4 && name.compare(name.size() - 4, 4, ".lua") == 0) name = name.substr(0, name.size() - 4);
     if (name.empty()) name = "my config";
+    if (name.size() < 4 || name.compare(name.size() - 4, 4, ".ini") != 0) name += ".ini";
     const std::string dir = app.configPath.empty() ? ensureDir("configs") : dirName(app.configPath);
-    const std::string path = fileDialog(true, L"Bridge config (*.ini)\0*.ini\0All files (*.*)\0*.*\0", dir,
-                                        name.size() > 4 && name.compare(name.size() - 4, 4, ".ini") == 0 ? name : name + ".ini",
-                                        L"ini");
+    const std::string path = fileDialog(true, L"Bridge config (*.ini)\0*.ini\0All files (*.*)\0*.*\0", dir, name, L"ini");
     if (path.empty()) return;
     std::string err;
     const Config c = currentConfig();
@@ -605,21 +990,26 @@ void saveConfigFile() {
     refreshChrome();
 }
 
+void loadConfigDialog() {
+    const std::string path = fileDialog(false, L"Bridge config (*.ini)\0*.ini\0All files (*.*)\0*.*\0",
+                                        app.configPath.empty() ? ensureDir("configs") : dirName(app.configPath), "", L"ini");
+    if (!path.empty()) loadConfigFile(path);
+}
+
 void openScript() {
-    const std::string cur = narrow(getText(IDC_SCRIPT));
     const std::string path = fileDialog(false, L"Lua scripts (*.lua)\0*.lua\0All files (*.*)\0*.*\0",
-                                        cur.empty() ? ensureDir("scripts") : dirName(cur), "", L"lua");
-    if (!path.empty()) SetWindowTextW(app.item(IDC_SCRIPT), widen(path).c_str());
+                                        app.scriptPath.empty() ? ensureDir("scripts") : dirName(app.scriptPath), "", L"lua");
+    if (!path.empty()) setScript(path);
 }
 
 void editScript() {
-    const std::wstring path = getText(IDC_SCRIPT);
-    if (path.empty()) return openScript();
+    if (app.scriptPath.empty()) return openScript();
+    const std::wstring path = widen(app.scriptPath);
     if (reinterpret_cast<INT_PTR>(ShellExecuteW(app.wnd, L"edit", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
         ShellExecuteW(app.wnd, L"open", L"notepad.exe", (L"\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
 
-void scriptMenu() {
+void libraryMenu() {
     std::vector<std::wstring> items;
     std::vector<std::string> paths;
     for (const char* folder : {"scripts", "examples"}) {
@@ -629,7 +1019,7 @@ void scriptMenu() {
             paths.push_back("");
         }
         for (const auto& f : files) {
-            items.push_back(widen(std::string(folder) + "\\" + fileName(f)));
+            items.push_back(widen(fileName(f)) + L"\t" + widen(folder));
             paths.push_back(f);
         }
     }
@@ -639,16 +1029,25 @@ void scriptMenu() {
     }
     items.push_back(L"Open the scripts folder");
     paths.push_back("*folder");
-
     int checked = -1;
     for (size_t i = 0; i < paths.size(); i++)
-        if (!paths[i].empty() && widen(paths[i]) == getText(IDC_SCRIPT)) checked = static_cast<int>(i);
-    const int i = popupMenu(app.fields[IDC_SCRIPT], items, checked);
+        if (!paths[i].empty() && paths[i] == app.scriptPath) checked = static_cast<int>(i);
+    const int i = popupList(clientRectOf(IDC_LIBRARY), items, checked);
     if (i < 0) return;
     if (paths[i] == "*folder")
         ShellExecuteW(app.wnd, L"open", widen(ensureDir("scripts")).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     else if (!paths[i].empty())
-        SetWindowTextW(app.item(IDC_SCRIPT), widen(paths[i]).c_str());
+        setScript(paths[i]);
+}
+
+void configMenu() {
+    const int i = popupList(clientRectOf(IDC_CONFIG),
+                            {L"Save\tCtrl+S", L"Save as…\tCtrl+Shift+S", L"", L"Load…\tCtrl+L", L"Open the configs folder"},
+                            -1, {true, true, false, !app.running(), true});
+    if (i == 0) saveConfigFile();
+    if (i == 1) saveConfigAs();
+    if (i == 3) loadConfigDialog();
+    if (i == 4) ShellExecuteW(app.wnd, L"open", widen(ensureDir("configs")).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void portMenu() {
@@ -663,212 +1062,508 @@ void portMenu() {
     int checked = -1;
     for (size_t i = 0; i < ports.size(); i++)
         if (widen(ports[i]) == getText(IDC_PORT)) checked = static_cast<int>(i);
-    const int i = popupMenu(app.fields[IDC_PORT], items, checked, &enabled);
+    const int i = popupList(app.fields[IDC_PORT], items, checked, enabled);
     if (i >= 0 && i < static_cast<int>(ports.size())) SetWindowTextW(app.item(IDC_PORT), items[i].c_str());
 }
 
 void deviceMenu() {
     std::vector<std::wstring> items;
     for (const auto& d : kDevices) items.push_back(widen(d.label));
-    const int i = popupMenu(clientRectOf(IDC_DEVICE), items, app.device);
+    const int i = popupList(clientRectOf(IDC_DEVICE), items, app.device);
     if (i < 0) return;
     app.device = i;
-    InvalidateRect(app.item(IDC_DEVICE), nullptr, TRUE);
     refreshChrome();
 }
 
 void hotkeyMenu() {
     std::vector<std::wstring> items;
     for (const auto& h : kHotkeys) items.push_back(h.label);
-    const int i = popupMenu(clientRectOf(IDC_HOTKEY), items, app.hotkey);
+    const int i = popupList(clientRectOf(IDC_HOTKEY), items, app.hotkey);
     if (i < 0) return;
     app.hotkey = i;
     registerHotkey();
-    InvalidateRect(app.item(IDC_HOTKEY), nullptr, TRUE);
+    InvalidateRect(app.item(IDC_HOTKEY), nullptr, FALSE);
     refreshChrome();
 }
 
 void extraMenu() {
-    const int i = popupMenu(clientRectOf(IDC_EXTRA), {kExtraLabels[0], kExtraLabels[1], kExtraLabels[2]}, app.extraKeys);
+    const int i = popupList(clientRectOf(IDC_EXTRA), {kExtraLabels[0], kExtraLabels[1], kExtraLabels[2]}, app.extraKeys);
     if (i < 0) return;
     app.extraKeys = i;
-    InvalidateRect(app.item(IDC_EXTRA), nullptr, TRUE);
+    InvalidateRect(app.item(IDC_EXTRA), nullptr, FALSE);
     refreshChrome();
 }
 
-// ------------------------------------------------------------------ drawing
+void toggle(int id, bool& value) {
+    const float from = value ? 1.0f : 0.0f;
+    value = !value;
+    app.anims[id] = {from, value ? 1.0f : 0.0f, GetTickCount()};
+    InvalidateRect(app.item(id), nullptr, FALSE);
+    refreshChrome();
+}
+
+float togglePos(int id, bool value) {
+    auto it = app.anims.find(id);
+    if (it == app.anims.end()) return value ? 1.0f : 0.0f;
+    const float t = std::min(1.0f, (GetTickCount() - it->second.start) / 160.0f);
+    const float e = 1 - (1 - t) * (1 - t) * (1 - t);  // ease out
+    return it->second.from + (it->second.to - it->second.from) * e;
+}
+
+// ------------------------------------------------------------------ backdrop (static parts)
+
+void paintBackdrop(Canvas& c, const RECT& client) {
+    {
+        Gdiplus::RectF all = c.rf(client);
+        all.Inflate(1, 1);
+        Gdiplus::LinearGradientBrush bg(all, gp(Color::bgTop), gp(Color::bgBottom), 90.0f);
+        c.g.FillRectangle(&bg, all);
+    }
+    glow(c, client.right * 0.18f, 0, app.Sf(420), Color::accent, 22);
+    glow(c, client.right * 0.9f, client.bottom * 0.35f, app.Sf(360), Color::accent2, 12);
+
+    // title bar separator
+    RECT sep = {0, app.titleH - 1, client.right, app.titleH};
+    fillRound(c, sep, 0, Color::white, 10);
+
+    // hero
+    const COLORREF heroEdge = app.status == App::Status::Running ? Color::success
+                              : app.status == App::Status::Error ? Color::danger : Color::cardBorder;
+    softShadow(c, app.heroRect, app.Sf(14), app.S(10));
+    gradientRound(c, app.heroRect, app.Sf(14), RGB(0x1c, 0x24, 0x3f), RGB(0x17, 0x19, 0x24), 25);
+    {
+        Gdiplus::GraphicsPath clip;
+        roundPath(clip, c.rf(app.heroRect), app.Sf(14));
+        c.g.SetClip(&clip);
+        RECT btn = clientRectOf(IDC_START);
+        const COLORREF glowCol = app.status == App::Status::Running ? Color::danger : Color::accent2;
+        glow(c, (btn.left + btn.right) / 2.0f, (btn.top + btn.bottom) / 2.0f, app.Sf(170), glowCol, 55);
+        glow(c, static_cast<float>(app.heroRect.left), static_cast<float>(app.heroRect.top), app.Sf(260), Color::accent, 30);
+        c.g.ResetClip();
+    }
+    strokeRound(c, app.heroRect, app.Sf(14), heroEdge, 1, app.status == App::Status::Stopped ? 255 : 150);
+
+    // cards
+    for (const auto& card : app.cards) {
+        softShadow(c, card.rect, app.Sf(12), app.S(8));
+        fillRound(c, card.rect, app.Sf(12), Color::card);
+        strokeRound(c, card.rect, app.Sf(12), Color::cardBorder);
+    }
+
+    // device help callout
+    fillRound(c, app.helpRect, app.Sf(9), Color::accent, 20);
+    strokeRound(c, app.helpRect, app.Sf(9), Color::accent, 1, 45);
+
+    // boxes behind edit controls
+    HWND focus = GetFocus();
+    for (const auto& f : app.fields) {
+        const bool isLog = f.first == IDC_LOG;
+        fillRound(c, f.second, app.Sf(8), isLog ? Color::logBg : Color::field);
+        const bool focused = !isLog && focus == app.item(f.first);
+        strokeRound(c, f.second, app.Sf(8), focused ? Color::accent : Color::border, focused ? app.Sf(1.5f) : 1);
+    }
+}
+
+void ensureBackdrop() {
+    RECT rc;
+    GetClientRect(app.wnd, &rc);
+    const SIZE size = {std::max<LONG>(rc.right, 1), std::max<LONG>(rc.bottom, 1)};
+    if (!app.backdropDC || size.cx != app.backdropSize.cx || size.cy != app.backdropSize.cy) {
+        if (app.backdropDC) {
+            DeleteDC(app.backdropDC);
+            DeleteObject(app.backdropBmp);
+        }
+        HDC screen = GetDC(nullptr);
+        app.backdropDC = CreateCompatibleDC(screen);
+        app.backdropBmp = CreateCompatibleBitmap(screen, size.cx, size.cy);
+        ReleaseDC(nullptr, screen);
+        SelectObject(app.backdropDC, app.backdropBmp);
+        app.backdropSize = size;
+        app.backdropDirty = true;
+    }
+    if (app.backdropDirty) {
+        Canvas c(app.backdropDC);
+        paintBackdrop(c, rc);
+        app.backdropDirty = false;
+    }
+}
+
+// ------------------------------------------------------------------ controls
 
 void drawButton(const DRAWITEMSTRUCT* di) {
-    HDC dc = di->hDC;
-    RECT r = di->rcItem;
     const int id = static_cast<int>(di->CtlID);
-    const Role role = app.roles[id];
+    const ButtonInfo info = app.buttons[id];
     const bool disabled = di->itemState & ODS_DISABLED, pressed = di->itemState & ODS_SELECTED;
     const bool hover = di->hwndItem == app.hover && !disabled;
     const bool focus = (di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT);
+    const RECT wr = clientRectOf(id);
+    const int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    if (w <= 0 || h <= 0) return;
 
-    // what's behind the control
-    COLORREF surface = Color::card;
-    if (id == IDC_START || id == IDC_STOP || id == IDC_OPEN || id == IDC_LOADCFG || id == IDC_SAVECFG ||
-        id == IDC_SAVEAS || id == IDC_RELOAD || id == IDC_EDIT)
-        surface = Color::bg;
-    if (role == Role::Chevron) surface = Color::field;
-
-    // paint off-screen to avoid flicker
-    const int w = r.right - r.left, h = r.bottom - r.top;
-    HDC mem = CreateCompatibleDC(dc);
-    HBITMAP bmp = CreateCompatibleBitmap(dc, w, h);
+    HDC mem = CreateCompatibleDC(di->hDC);
+    HBITMAP bmp = CreateCompatibleBitmap(di->hDC, w, h);
     HGDIOBJ oldBmp = SelectObject(mem, bmp);
-    RECT rc = {0, 0, w, h};
-    HBRUSH sb = CreateSolidBrush(surface);
-    FillRect(mem, &rc, sb);
-    DeleteObject(sb);
+    ensureBackdrop();
+    BitBlt(mem, 0, 0, w, h, app.backdropDC, wr.left, wr.top, SRCCOPY);
 
-    wchar_t label[128] = L"";
-    GetWindowTextW(di->hwndItem, label, 128);
-    const int radius = app.S(7);
-
-    switch (role) {
-        case Role::Primary:
-        case Role::Danger: {
-            COLORREF fill = role == Role::Primary ? (hover ? Color::accentHover : Color::accent)
-                                                  : (hover ? Color::dangerHover : Color::danger);
-            if (pressed) fill = mix(fill, Color::bg, 0.25);
-            if (disabled) fill = Color::field;
-            roundRect(mem, rc, radius, fill);
-            const COLORREF fg = disabled ? Color::muted : Color::white;
-            const int tw = textWidth(mem, label, app.fontBold), icon = app.S(10), gap = app.S(8);
-            const int x = (w - tw - icon - gap) / 2, cy = h / 2;
-            if (role == Role::Primary) {
-                polygon(mem, {{static_cast<float>(x), cy - icon / 2.0f}, {static_cast<float>(x + icon), static_cast<float>(cy)},
-                              {static_cast<float>(x), cy + icon / 2.0f}}, fg);
-            } else {
-                RECT sq = {x, cy - icon / 2, x + icon, cy + icon / 2};
-                roundRect(mem, sq, app.S(2), fg);
+    wchar_t labelBuf[128] = L"";
+    GetWindowTextW(di->hwndItem, labelBuf, 128);
+    const std::wstring label = labelBuf;
+    {
+        Canvas c(mem, wr.left, wr.top);
+        const float radius = app.Sf(8);
+        const COLORREF fg = disabled ? Color::faint : Color::text;
+        switch (info.role) {
+            case Role::Hero: {
+                const bool run = app.running();
+                COLORREF a = run ? Color::danger : Color::accent, b = run ? RGB(0xd9, 0x46, 0x8f) : Color::accent2;
+                if (hover) a = mix(a, Color::white, 0.12), b = mix(b, Color::white, 0.12);
+                if (pressed) a = mix(a, Color::black, 0.15), b = mix(b, Color::black, 0.15);
+                const float d = static_cast<float>(std::min(w, h)) - app.Sf(4);
+                const float x = wr.left + (w - d) / 2.0f - c.ox, y = wr.top + (h - d) / 2.0f - c.oy;
+                Gdiplus::GraphicsPath circle;
+                circle.AddEllipse(x, y, d, d);
+                Gdiplus::LinearGradientBrush br(Gdiplus::RectF(x - 1, y - 1, d + 2, d + 2), gp(a), gp(b), 45.0f);
+                c.g.FillPath(&br, &circle);
+                Gdiplus::Pen rim(gp(Color::white, 40), app.Sf(1.2f));
+                c.g.DrawEllipse(&rim, x + 1, y + 1, d - 2, d - 2);
+                const int is = static_cast<int>(d * 0.36f);
+                RECT ib = {wr.left + (w - is) / 2 + (run ? 0 : app.S(2)), wr.top + (h - is) / 2,
+                           wr.left + (w - is) / 2 + is + (run ? 0 : app.S(2)), wr.top + (h - is) / 2 + is};
+                drawIcon(c, run ? Icon::Stop : Icon::Play, ib, Color::white, app.Sf(2));
+                if (focus) {
+                    Gdiplus::Pen ring(gp(Color::white, 120), app.Sf(1.5f));
+                    c.g.DrawEllipse(&ring, x - app.Sf(3), y - app.Sf(3), d + app.Sf(6), d + app.Sf(6));
+                }
+                break;
             }
-            RECT tr = {x + icon + gap, 0, w, h};
-            text(mem, label, tr, app.fontBold, fg);
-            break;
-        }
-        case Role::Secondary: {
-            COLORREF fill = hover ? Color::fieldHover : Color::field;
-            if (pressed) fill = Color::border;
-            roundRect(mem, rc, radius, fill, hover ? Color::borderHover : Color::border);
-            text(mem, label, rc, app.font, disabled ? Color::muted : Color::text, DT_CENTER | DT_VCENTER);
-            break;
-        }
-        case Role::Dropdown: {
-            roundRect(mem, rc, radius, hover ? Color::fieldHover : Color::field,
-                      focus ? Color::accent : hover ? Color::borderHover : Color::border);
-            std::wstring value = id == IDC_DEVICE   ? widen(kDevices[app.device].label)
-                                 : id == IDC_HOTKEY ? std::wstring(kHotkeys[app.hotkey].label)
-                                                    : std::wstring(kExtraLabels[app.extraKeys]);
-            RECT tr = {app.S(12), 0, w - app.S(34), h};
-            text(mem, value, tr, app.font, disabled ? Color::muted : Color::text);
-            chevron(mem, w - app.S(18), h / 2, app.S(10), app.dpi / 96.0f * 1.6f, Color::muted);
-            break;
-        }
-        case Role::Chevron: {
-            if (hover || pressed) {
-                RECT hr = {app.S(2), app.S(2), w - app.S(2), h - app.S(2)};
-                roundRect(mem, hr, app.S(5), pressed ? Color::border : Color::fieldHover);
+            case Role::Ghost:
+            case Role::Secondary: {
+                if (info.role == Role::Secondary) {
+                    fillRound(c, wr, radius, hover ? Color::fieldHover : Color::field);
+                    strokeRound(c, wr, radius, hover ? Color::borderHover : Color::border);
+                } else if (hover || pressed) {
+                    fillRound(c, wr, radius, Color::white, pressed ? 26 : 14);
+                }
+                if (pressed && info.role == Role::Secondary) fillRound(c, wr, radius, Color::black, 40);
+                const int is = app.S(16), gap = label.empty() ? 0 : app.S(8);
+                const int tw = label.empty() ? 0 : textWidth(mem, label, app.font);
+                const int total = (info.icon != Icon::None ? is : 0) + gap + tw;
+                const int x = wr.left + (w - total) / 2;
+                if (info.icon != Icon::None) {
+                    RECT ib = {x, wr.top + (h - is) / 2, x + is, wr.top + (h - is) / 2 + is};
+                    drawIcon(c, info.icon, ib, disabled ? Color::faint : hover ? Color::white : Color::muted,
+                             app.Sf(1.6f));
+                }
+                if (!label.empty()) {
+                    RECT tr = {x + (info.icon != Icon::None ? is + gap : 0), wr.top, wr.right, wr.bottom};
+                    text(c, label, tr, app.font, fg);
+                }
+                if (focus) strokeRound(c, wr, radius, Color::accent, app.Sf(1.5f), 180);
+                break;
             }
-            chevron(mem, w / 2, h / 2, app.S(10), app.dpi / 96.0f * 1.6f, disabled ? Color::border : Color::muted);
-            break;
-        }
-        case Role::Toggle: {
-            const bool on = id == IDC_KEYFALLBACK ? app.keyFallback : app.autoStart;
-            const int tw = app.S(38), th = app.S(22), ty = (h - th) / 2;
-            RECT track = {0, ty, tw, ty + th};
-            COLORREF trackColor = on ? (hover ? Color::accentHover : Color::accent) : (hover ? Color::borderHover : Color::border);
-            if (disabled) trackColor = mix(trackColor, Color::card, 0.55);
-            roundRect(mem, track, th / 2, trackColor);
-            const float knobR = th / 2.0f - app.S(4);
-            circle(mem, on ? tw - th / 2.0f : th / 2.0f, ty + th / 2.0f, knobR, disabled ? Color::muted : Color::white);
-            if (focus) roundRect(mem, track, th / 2, trackColor, Color::accentHover);
-            RECT tr = {tw + app.S(12), 0, w, h};
-            text(mem, label, tr, app.font, disabled ? Color::muted : Color::text);
-            break;
+            case Role::Dropdown: {
+                fillRound(c, wr, radius, hover ? Color::fieldHover : Color::field);
+                strokeRound(c, wr, radius, focus ? Color::accent : hover ? Color::borderHover : Color::border,
+                            focus ? app.Sf(1.5f) : 1);
+                const std::wstring value = id == IDC_DEVICE   ? widen(kDevices[app.device].label)
+                                           : id == IDC_HOTKEY ? std::wstring(kHotkeys[app.hotkey].label)
+                                                              : std::wstring(kExtraLabels[app.extraKeys]);
+                RECT tr = {wr.left + app.S(12), wr.top, wr.right - app.S(34), wr.bottom};
+                text(c, value, tr, app.font, fg);
+                RECT ib = {wr.right - app.S(28), wr.top + (h - app.S(16)) / 2, wr.right - app.S(12),
+                           wr.top + (h + app.S(16)) / 2};
+                drawIcon(c, Icon::Chevron, ib, disabled ? Color::faint : Color::muted, app.Sf(1.6f));
+                break;
+            }
+            case Role::Chevron: {
+                if (hover || pressed) {
+                    RECT hr = wr;
+                    InflateRect(&hr, -app.S(3), -app.S(3));
+                    fillRound(c, hr, app.Sf(6), pressed ? Color::border : Color::fieldHover);
+                }
+                RECT ib = {wr.left + (w - app.S(16)) / 2, wr.top + (h - app.S(16)) / 2, wr.left + (w + app.S(16)) / 2,
+                           wr.top + (h + app.S(16)) / 2};
+                drawIcon(c, info.icon == Icon::None ? Icon::Chevron : info.icon, ib,
+                         disabled ? Color::faint : Color::muted, app.Sf(1.6f));
+                break;
+            }
+            case Role::Toggle: {
+                const bool on = id == IDC_KEYFALLBACK ? app.keyFallback : app.autoStart;
+                const float pos = togglePos(id, on);
+                const int tw = app.S(40), th = app.S(22);
+                RECT track = {wr.left, wr.top + (h - th) / 2, wr.left + tw, wr.top + (h - th) / 2 + th};
+                COLORREF off = hover ? Color::borderHover : Color::border;
+                COLORREF col = mix(off, hover ? Color::accentHover : Color::accent, pos);
+                if (disabled) col = mix(col, Color::card, 0.5);
+                fillRound(c, track, th / 2.0f, col);
+                const float knob = th / 2.0f - app.Sf(3.5f);
+                const float kx = track.left + th / 2.0f + pos * (tw - th) - c.ox, ky = track.top + th / 2.0f - c.oy;
+                Gdiplus::SolidBrush kb(gp(disabled ? Color::muted : Color::white));
+                c.g.FillEllipse(&kb, kx - knob, ky - knob, knob * 2, knob * 2);
+                if (focus) strokeRound(c, track, th / 2.0f, Color::accentHover, app.Sf(1.5f));
+                RECT tr = {track.right + app.S(12), wr.top, wr.right, wr.bottom};
+                text(c, label, tr, app.font, disabled ? Color::faint : Color::text);
+                break;
+            }
+            case Role::Caption:
+            case Role::CaptionClose: {
+                if (hover || pressed) {
+                    if (info.role == Role::CaptionClose) fillRound(c, wr, 0, Color::danger, pressed ? 200 : 255);
+                    else fillRound(c, wr, 0, Color::white, pressed ? 24 : 14);
+                }
+                const Icon glyph = id == IDC_MAX && IsZoomed(app.wnd) ? Icon::Restore : info.icon;
+                const int is = app.S(18);
+                RECT ib = {wr.left + (w - is) / 2, wr.top + (h - is) / 2, wr.left + (w + is) / 2, wr.top + (h + is) / 2};
+                drawIcon(c, glyph, ib, hover ? Color::white : Color::text, app.Sf(1.2f));
+                break;
+            }
+            case Role::Chip: {
+                const float r = h / 2.0f;
+                fillRound(c, wr, r, hover ? Color::fieldHover : Color::field, 230);
+                strokeRound(c, wr, r, hover ? Color::borderHover : Color::border);
+                const bool dirty = modified();
+                const COLORREF dot = app.configPath.empty() ? Color::faint : dirty ? Color::accent : Color::success;
+                Gdiplus::SolidBrush db(gp(dot));
+                c.g.FillEllipse(&db, wr.left + app.Sf(12) - c.ox, wr.top + h / 2.0f - app.Sf(3.5f) - c.oy, app.Sf(7),
+                                app.Sf(7));
+                const std::wstring name = app.configPath.empty() ? L"No config" : widen(fileName(app.configPath));
+                RECT tr = {wr.left + app.S(26), wr.top, wr.right - (dirty ? app.S(84) : app.S(30)), wr.bottom};
+                text(c, name, tr, app.fontBold, app.configPath.empty() ? Color::muted : Color::text);
+                RECT st = {wr.right - app.S(84), wr.top, wr.right - app.S(28), wr.bottom};
+                if (dirty) text(c, L"unsaved", st, app.fontSmall, Color::accent, DT_RIGHT | DT_VCENTER);
+                RECT ib = {wr.right - app.S(24), wr.top + (h - app.S(14)) / 2, wr.right - app.S(10),
+                           wr.top + (h + app.S(14)) / 2};
+                drawIcon(c, Icon::Chevron, ib, Color::muted, app.Sf(1.6f));
+                break;
+            }
         }
     }
-    if (focus && (role == Role::Primary || role == Role::Danger || role == Role::Secondary)) {
-        roundRect(mem, rc, radius, CLR_INVALID, Color::accentHover);
-    }
-    BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+    BitBlt(di->hDC, 0, 0, w, h, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
     DeleteDC(mem);
 }
 
+// ------------------------------------------------------------------ window painting
+
+// Mouse picture whose buttons light up: filled = pressed on the mouse, outlined = held by the script.
+void paintMouse(Canvas& c) {
+    bool phys[6] = {}, script[6] = {};
+    for (int n = 1; n <= 5 && app.engine; n++) app.engine->buttonState(n, phys[n], script[n]);
+    const bool live = app.running();
+
+    const float bw = app.Sf(106), bh = app.Sf(166);
+    const RECT& a = app.mouseArea;
+    const float bx = a.left + (a.right - a.left - bw) / 2.0f + app.Sf(8) - c.ox;
+    const float by = a.top + (a.bottom - a.top - bh) / 2.0f - c.oy;
+    const float r2 = app.Sf(44), splitY = by + bh * 0.42f, cx = bx + bw / 2;
+
+    Gdiplus::GraphicsPath body;
+    body.AddArc(bx, by, bw, bw, 180, 180);
+    body.AddArc(bx + bw - 2 * r2, by + bh - 2 * r2, 2 * r2, 2 * r2, 0, 90);
+    body.AddArc(bx, by + bh - 2 * r2, 2 * r2, 2 * r2, 90, 90);
+    body.CloseFigure();
+
+    if (live) glow(c, cx + c.ox, by + bh / 2 + c.oy, app.Sf(110), Color::accent, 26);
+    {
+        Gdiplus::LinearGradientBrush fill(Gdiplus::RectF(bx, by, bw, bh), gp(RGB(0x26, 0x2b, 0x36)),
+                                          gp(RGB(0x1a, 0x1e, 0x26)), 90.0f);
+        c.g.FillPath(&fill, &body);
+    }
+
+    // how a button part looks: pressed on the mouse, held by the script, or idle
+    struct Look {
+        std::unique_ptr<Gdiplus::Brush> brush;
+        COLORREF line, number;
+        float width;
+    };
+    auto look = [&](int n, const Gdiplus::RectF& box) {
+        Look l;
+        l.width = 1;
+        if (phys[n]) {
+            l.brush.reset(new Gdiplus::LinearGradientBrush(box, gp(Color::accent), gp(Color::accent2), 60.0f));
+            l.line = Color::accentHover;
+            l.number = Color::white;
+        } else if (script[n]) {
+            l.brush.reset(new Gdiplus::SolidBrush(gp(mix(Color::field, Color::accent, 0.3))));
+            l.line = Color::accentHover;
+            l.width = app.Sf(2);
+            l.number = Color::white;
+        } else {
+            l.brush.reset(new Gdiplus::SolidBrush(gp(Color::black, 0)));
+            l.line = live ? Color::borderHover : Color::border;
+            l.number = live ? Color::muted : Color::faint;
+        }
+        return l;
+    };
+
+    // left and right buttons: the body clipped to each top quarter
+    for (int side = 0; side < 2; side++) {
+        const int n = side == 0 ? 1 : 2;
+        Gdiplus::RectF box(side == 0 ? bx : cx, by, bw / 2, splitY - by);
+        Gdiplus::Region reg(&body);
+        reg.Intersect(box);
+        Look l = look(n, box);
+        c.g.FillRegion(l.brush.get(), &reg);
+        RECT nr = {static_cast<LONG>(box.X + c.ox), static_cast<LONG>(box.Y + box.Height * 0.45f + c.oy),
+                   static_cast<LONG>(box.X + box.Width + c.ox), static_cast<LONG>(splitY + c.oy)};
+        if (side == 0) nr.right -= app.S(6);
+        else nr.left += app.S(6);
+        text(c, side == 0 ? L"1" : L"2", nr, app.fontSmall, l.number, DT_CENTER | DT_VCENTER);
+    }
+    {
+        Gdiplus::Pen outline(gp(live ? Color::borderHover : Color::border), app.Sf(1.2f));
+        c.g.DrawPath(&outline, &body);
+        c.g.SetClip(&body);
+        c.g.DrawLine(&outline, bx, splitY, bx + bw, splitY);
+        c.g.DrawLine(&outline, cx, by, cx, splitY);
+        c.g.ResetClip();
+    }
+    // wheel and side buttons
+    auto part = [&](int n, Gdiplus::RectF box, float rad, const wchar_t* num, bool numLeft) {
+        Look l = look(n, box);
+        Gdiplus::GraphicsPath p;
+        roundPath(p, box, rad);
+        Gdiplus::SolidBrush base(gp(RGB(0x22, 0x26, 0x30)));
+        c.g.FillPath(&base, &p);
+        c.g.FillPath(l.brush.get(), &p);
+        Gdiplus::Pen pen(gp(l.line), l.width);
+        c.g.DrawPath(&pen, &p);
+        RECT nr;
+        if (numLeft)
+            nr = {static_cast<LONG>(box.X - app.Sf(22) + c.ox), static_cast<LONG>(box.Y + c.oy),
+                  static_cast<LONG>(box.X - app.Sf(4) + c.ox), static_cast<LONG>(box.Y + box.Height + c.oy)};
+        else
+            nr = {static_cast<LONG>(box.X - app.Sf(10) + c.ox), static_cast<LONG>(box.Y + box.Height + app.Sf(2) + c.oy),
+                  static_cast<LONG>(box.X + box.Width + app.Sf(10) + c.ox),
+                  static_cast<LONG>(box.Y + box.Height + app.Sf(16) + c.oy)};
+        text(c, num, nr, app.fontTiny, phys[n] || script[n] ? Color::accentHover : l.number,
+             (numLeft ? DT_RIGHT : DT_CENTER) | DT_VCENTER);
+    };
+    part(3, Gdiplus::RectF(cx - app.Sf(6), by + app.Sf(16), app.Sf(12), app.Sf(26)), app.Sf(6), L"3", false);
+    part(5, Gdiplus::RectF(bx - app.Sf(7), by + bh * 0.46f, app.Sf(10), app.Sf(22)), app.Sf(4), L"5", true);
+    part(4, Gdiplus::RectF(bx - app.Sf(7), by + bh * 0.46f + app.Sf(28), app.Sf(10), app.Sf(22)), app.Sf(4), L"4", true);
+
+    // legend
+    const RECT& lg = app.legendRect;
+    if (!live) {
+        text(c, L"Start a script to see buttons live", lg, app.fontSmall, Color::faint, DT_CENTER | DT_VCENTER);
+        return;
+    }
+    const int dot = app.S(10), half = (lg.right - lg.left) / 2;
+    RECT d1 = {lg.left + app.S(8), (lg.top + lg.bottom - dot) / 2, lg.left + app.S(8) + dot, (lg.top + lg.bottom + dot) / 2};
+    gradientRound(c, d1, app.Sf(3), Color::accent, Color::accent2, 60);
+    RECT t1 = {d1.right + app.S(6), lg.top, lg.left + half, lg.bottom};
+    text(c, L"pressed", t1, app.fontSmall, Color::muted);
+    RECT d2 = {lg.left + half + app.S(4), d1.top, lg.left + half + app.S(4) + dot, d1.bottom};
+    fillRound(c, d2, app.Sf(3), mix(Color::field, Color::accent, 0.3));
+    strokeRound(c, d2, app.Sf(3), Color::accentHover, app.Sf(1.5f));
+    RECT t2 = {d2.right + app.S(6), lg.top, lg.right, lg.bottom};
+    text(c, L"by script", t2, app.fontSmall, Color::muted);
+}
+
 void paintWindow(HDC target) {
     RECT client;
     GetClientRect(app.wnd, &client);
+    ensureBackdrop();
     HDC dc = CreateCompatibleDC(target);
     HBITMAP bmp = CreateCompatibleBitmap(target, client.right, client.bottom);
     HGDIOBJ old = SelectObject(dc, bmp);
-    HBRUSH bg = CreateSolidBrush(Color::bg);
-    FillRect(dc, &client, bg);
-    DeleteObject(bg);
+    BitBlt(dc, 0, 0, client.right, client.bottom, app.backdropDC, 0, 0, SRCCOPY);
+    {
+        Canvas c(dc);
 
-    // header
-    const int m = app.S(20);
-    RECT t = {m, app.S(14), client.right / 2, app.S(44)};
-    text(dc, L"Logitech Script Bridge", t, app.fontTitle, Color::text);
-    std::wstring sub = L"Run Logitech G HUB Lua scripts on any mouse";
-    if (!app.configPath.empty())
-        sub = L"Config: " + widen(fileName(app.configPath)) + (modified() ? L"  •  unsaved changes" : L"");
-    RECT st = {m, app.S(44), client.right - app.S(260), app.S(64)};
-    text(dc, sub, st, app.fontSmall, modified() ? mix(Color::muted, Color::accent, 0.6) : Color::muted);
+        // title bar
+        const int ls = app.S(22);
+        RECT logo = {app.S(14), (app.titleH - ls) / 2, app.S(14) + ls, (app.titleH + ls) / 2};
+        drawLogo(c, logo);
+        RECT tt = {logo.right + app.S(10), 0, logo.right + app.S(260), app.titleH};
+        text(c, L"Logitech Script Bridge", tt, app.fontTitle, Color::text);
+        const int tw = textWidth(dc, L"Logitech Script Bridge", app.fontTitle);
+        RECT vt = {tt.left + tw + app.S(8), 0, tt.left + tw + app.S(60), app.titleH};
+        text(c, kVersion, vt, app.fontSmall, Color::faint);
 
-    // status pill
-    const wchar_t* status = app.status == App::Status::Running ? L"Running"
-                            : app.status == App::Status::Error ? L"Script error" : L"Stopped";
-    const COLORREF sc = app.status == App::Status::Running ? Color::success
-                        : app.status == App::Status::Error ? Color::danger : Color::muted;
-    const int pw = textWidth(dc, status, app.fontSmall) + app.S(34);
-    RECT stop = clientRectOf(IDC_STOP);
-    app.pillRect = {stop.left - app.S(12) - pw, stop.top + app.S(6), stop.left - app.S(12), stop.bottom - app.S(6)};
-    roundRect(dc, app.pillRect, (app.pillRect.bottom - app.pillRect.top) / 2, mix(Color::bg, sc, 0.16), mix(Color::bg, sc, 0.35));
-    circle(dc, static_cast<float>(app.pillRect.left + app.S(14)), (app.pillRect.top + app.pillRect.bottom) / 2.0f,
-           static_cast<float>(app.S(4)), sc);
-    RECT pt = {app.pillRect.left + app.S(24), app.pillRect.top, app.pillRect.right, app.pillRect.bottom};
-    text(dc, status, pt, app.fontSmall, mix(sc, Color::text, 0.35));
+        // hero
+        const RECT& hero = app.heroRect;
+        const int pad = app.S(24);
+        const wchar_t* status = app.status == App::Status::Running ? L"RUNNING"
+                                : app.status == App::Status::Error ? L"SCRIPT ERROR" : L"STOPPED";
+        const COLORREF sc = app.status == App::Status::Running ? Color::success
+                            : app.status == App::Status::Error ? Color::danger : Color::muted;
+        const int pw = textWidth(dc, status, app.fontCaption, 1) + app.S(30);
+        RECT pill = {hero.left + pad, hero.top + app.S(20), hero.left + pad + pw, hero.top + app.S(44)};
+        fillRound(c, pill, (pill.bottom - pill.top) / 2.0f, sc, 34);
+        strokeRound(c, pill, (pill.bottom - pill.top) / 2.0f, sc, 1, 90);
+        Gdiplus::SolidBrush sb(gp(sc));
+        c.g.FillEllipse(&sb, pill.left + app.Sf(11), (pill.top + pill.bottom) / 2.0f - app.Sf(3.5f), app.Sf(7), app.Sf(7));
+        RECT pt = {pill.left + app.S(23), pill.top, pill.right, pill.bottom};
+        text(c, status, pt, app.fontCaption, mix(sc, Color::white, 0.25), DT_LEFT | DT_VCENTER, 1);
 
-    // cards
-    for (const auto& c : app.cards) {
-        roundRect(dc, c.rect, app.S(10), Color::card, Color::border);
-        RECT cr = {c.rect.left + app.S(16), c.rect.top + app.S(12), c.rect.right - app.S(16), c.rect.top + app.S(30)};
-        text(dc, c.caption, cr, app.fontSmall, Color::muted);
+        RECT btn = clientRectOf(IDC_START);
+        const bool hasScript = !app.scriptPath.empty();
+        RECT name = {hero.left + pad, hero.top + app.S(50), btn.left - app.S(40), hero.top + app.S(88)};
+        std::wstring scriptName = hasScript ? widen(fileName(app.scriptPath)) : L"No script selected";
+        if (hasScript && scriptName.size() > 4 && _wcsicmp(scriptName.c_str() + scriptName.size() - 4, L".lua") == 0)
+            scriptName = scriptName.substr(0, scriptName.size() - 4);
+        text(c, scriptName, name, app.fontHero, hasScript ? Color::white : Color::muted);
+
+        std::wstring sub;
+        if (hasScript) {
+            const std::string folder = fileName(dirName(app.scriptPath));
+            sub = widen(folder.empty() ? app.scriptPath : folder + "\\" + fileName(app.scriptPath));
+            sub += L"   ·   " + widen(kDevices[app.device].label);
+            const double jmin = readPx(IDC_JITTER_MIN), jmax = readPx(IDC_JITTER_MAX);
+            if (std::max(jmin, jmax) > 0)
+                sub += L"   ·   wobble " + formatPx(std::min(jmin, jmax)) + L"–" + formatPx(std::max(jmin, jmax)) + L" px";
+            if (kHotkeys[app.hotkey].vk) sub += L"   ·   " + std::wstring(kHotkeys[app.hotkey].label) + L" starts/stops";
+        } else {
+            sub = L"Open a Logitech G HUB .lua script to get started, or drop one on this window";
+        }
+        RECT subr = {hero.left + pad, hero.top + app.S(88), btn.left - app.S(40), hero.top + app.S(108)};
+        text(c, sub, subr, app.font, Color::muted);
+
+        // pulsing ring around the big button while running
+        if (app.running()) {
+            const float t = (GetTickCount() % 1600) / 1600.0f;
+            const float d = static_cast<float>(btn.right - btn.left) - app.Sf(4);
+            const float grow = app.Sf(3) + t * app.Sf(16);
+            Gdiplus::Pen ring(gp(Color::danger, static_cast<BYTE>(110 * (1 - t))), app.Sf(2));
+            const float x = (btn.left + btn.right) / 2.0f - d / 2 - grow, y = (btn.top + btn.bottom) / 2.0f - d / 2 - grow;
+            c.g.DrawEllipse(&ring, x, y, d + 2 * grow, d + 2 * grow);
+        }
+        const std::wstring big = app.running() ? L"Stop" : L"Start";
+        const std::wstring keys = app.running() ? L"Shift+F5" : L"F5";
+        const RECT& bl = app.bigLabelRect;
+        const int bwid = textWidth(dc, big, app.fontBold), kwid = textWidth(dc, keys, app.fontSmall);
+        const int bx = (bl.left + bl.right - bwid - kwid - app.S(8)) / 2;
+        RECT b1 = {bx, bl.top, bx + bwid, bl.bottom};
+        RECT b2 = {bx + bwid + app.S(8), bl.top, bx + bwid + app.S(8) + kwid, bl.bottom};
+        text(c, big, b1, app.fontBold, Color::text);
+        text(c, keys, b2, app.fontSmall, Color::faint);
+
+        // card captions and labels
+        for (const auto& card : app.cards) {
+            RECT cr = {card.rect.left + app.S(18), card.rect.top + app.S(14), card.rect.right - app.S(18),
+                       card.rect.top + app.S(30)};
+            text(c, card.caption, cr, app.fontCaption, Color::muted, DT_LEFT | DT_VCENTER, 1);
+        }
+        RECT lr = {app.mouseCard.left, app.mouseCard.top + app.S(14), app.mouseCard.right - app.S(18),
+                   app.mouseCard.top + app.S(30)};
+        text(c, app.running() ? L"● LIVE" : L"IDLE", lr, app.fontCaption, app.running() ? Color::success : Color::faint,
+             DT_RIGHT | DT_VCENTER, 1);
+        for (const auto& l : app.labels) text(c, l.text, l.rect, app.fontSmall, Color::muted);
+
+        // device help callout
+        RECT ib = {app.helpRect.left + app.S(12), app.helpRect.top + app.S(12), app.helpRect.left + app.S(28),
+                   app.helpRect.top + app.S(28)};
+        drawIcon(c, Icon::Info, ib, Color::accentHover, app.Sf(1.5f));
+        RECT ht = {app.helpRect.left + app.S(38), app.helpRect.top + app.S(11), app.helpRect.right - app.S(12),
+                   app.helpRect.bottom - app.S(8)};
+        text(c, kDeviceHelp[app.device], ht, app.font, mix(Color::text, Color::muted, 0.35), DT_LEFT | DT_WORDBREAK);
+
+        paintMouse(c);
     }
-    for (const auto& l : app.labels) text(dc, l.text, l.rect, app.fontSmall, Color::muted);
-
-    // fields behind edit controls
-    HWND focus = GetFocus();
-    for (const auto& f : app.fields) {
-        const bool isLog = f.first == IDC_LOG;
-        const bool focused = focus == app.item(f.first);
-        roundRect(dc, f.second, app.S(7), isLog ? Color::logBg : Color::field,
-                  focused && !isLog ? Color::accent : Color::border);
-    }
-    // device hint
-    text(dc, widen(kDevices[app.device].hint), app.hintRect, app.fontSmall, Color::muted);
-
-    // live mouse buttons: filled = pressed on the mouse, outlined = held by the script
-    const wchar_t* names[] = {L"1  Left", L"2  Right", L"3  Middle", L"4  Back", L"5  Fwd"};
-    const int pillGap = app.S(6), count = 5;
-    const int pillW = (app.buttonsRect.right - app.buttonsRect.left - pillGap * (count - 1)) / count;
-    for (int i = 0; i < count; i++) {
-        bool phys = false, script = false;
-        if (app.engine) app.engine->buttonState(i + 1, phys, script);
-        RECT pr = {app.buttonsRect.left + i * (pillW + pillGap), app.buttonsRect.top,
-                   app.buttonsRect.left + i * (pillW + pillGap) + pillW, app.buttonsRect.bottom};
-        const COLORREF fill = phys ? Color::accent : Color::field;
-        const COLORREF line = script ? Color::accentHover : phys ? Color::accent : Color::border;
-        roundRect(dc, pr, app.S(6), fill, line, script ? app.S(2) : 1);
-        const COLORREF fg = phys ? Color::white : script ? Color::accentHover : app.engine ? Color::text : Color::muted;
-        text(dc, names[i], pr, app.fontSmall, fg, DT_CENTER | DT_VCENTER);
-    }
-
     BitBlt(target, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, old);
     DeleteObject(bmp);
@@ -880,9 +1575,9 @@ void paintWindow(HDC target) {
 void layout() {
     RECT rc;
     GetClientRect(app.wnd, &rc);
-    const int W = rc.right, H = rc.bottom, m = app.S(20), pad = app.S(16), fh = app.S(36), gap = app.S(8);
+    const int W = rc.right, H = rc.bottom, m = app.S(20), gap = app.S(14), pad = app.S(18), fh = app.S(34),
+              g8 = app.S(8);
     auto place = [](int id, int x, int y, int w, int h) { MoveWindow(app.item(id), x, y, w, h, FALSE); };
-    // an edit inside a painted field box, text vertically centred
     auto field = [&](int id, int x, int y, int w, int rightInset = 0) {
         app.fields[id] = {x, y, x + w, y + fh};
         const int th = app.S(18);
@@ -891,80 +1586,86 @@ void layout() {
     app.cards.clear();
     app.labels.clear();
 
-    // header
-    app.header = {0, 0, W, app.S(70)};
-    place(IDC_START, W - m - app.S(112), app.S(18), app.S(112), app.S(38));
-    place(IDC_STOP, W - m - app.S(112) - gap - app.S(96), app.S(18), app.S(96), app.S(38));
+    // title bar
+    app.titleH = app.S(44);
+    const int cb = app.S(46);
+    place(IDC_CLOSE, W - cb, 0, cb, app.titleH - 1);
+    place(IDC_MAX, W - 2 * cb, 0, cb, app.titleH - 1);
+    place(IDC_MIN, W - 3 * cb, 0, cb, app.titleH - 1);
+    const int chipW = app.S(240);
+    place(IDC_CONFIG, W - 3 * cb - app.S(16) - chipW, app.S(8), chipW, app.titleH - app.S(16));
 
-    // toolbar
-    int x = m, y = app.S(76);
-    const int bh = app.S(32);
-    const struct { int id, width; } toolbar[] = {{IDC_OPEN, 112}, {IDC_LOADCFG, 112}, {IDC_SAVECFG, 112}, {IDC_SAVEAS, 96}};
-    for (const auto& b : toolbar) {
-        place(b.id, x, y, app.S(b.width), bh);
-        x += app.S(b.width) + gap;
+    // hero
+    app.heroRect = {m, app.titleH + app.S(8), W - m, app.titleH + app.S(8) + app.S(156)};
+    const int d = app.S(88);
+    RECT btn = {app.heroRect.right - app.S(52) - d, app.heroRect.top + app.S(20), app.heroRect.right - app.S(52),
+                app.heroRect.top + app.S(20) + d};
+    place(IDC_START, btn.left, btn.top, d, d);
+    app.ringRect = btn;
+    InflateRect(&app.ringRect, app.S(22), app.S(22));
+    app.bigLabelRect = {btn.left - app.S(40), btn.bottom + app.S(8), btn.right + app.S(40), btn.bottom + app.S(28)};
+    int x = app.heroRect.left + app.S(14);
+    const int hy = app.heroRect.top + app.S(114);
+    const struct { int id, width; } heroButtons[] = {{IDC_OPEN, 96}, {IDC_LIBRARY, 104}, {IDC_EDIT, 84}, {IDC_RELOAD, 96}};
+    for (const auto& b : heroButtons) {
+        place(b.id, x, hy, app.S(b.width), app.S(32));
+        x += app.S(b.width) + app.S(4);
     }
-    place(IDC_RELOAD, W - m - app.S(96), y, app.S(96), bh);
-    place(IDC_EDIT, W - m - app.S(96) - gap - app.S(104), y, app.S(104), bh);
 
-    // script card
-    y = app.S(122);
-    app.cards.push_back({{m, y, W - m, y + app.S(88)}, L"SCRIPT"});
-    const int browseW = app.S(96);
-    field(IDC_SCRIPT, m + pad, y + app.S(38), W - 2 * m - 2 * pad - browseW - gap, app.S(34));
-    RECT sf = app.fields[IDC_SCRIPT];
-    place(IDC_SCRIPT_MENU, sf.right - app.S(36), sf.top + app.S(3), app.S(33), fh - app.S(6));
-    place(IDC_BROWSE, sf.right + gap, sf.top, browseW, fh);
+    // device / options / mouse cards
+    const int y = app.heroRect.bottom + gap, cardH = app.S(262);
+    const int mouseW = app.S(230), avail = W - 2 * m - 2 * gap - mouseW;
+    const int devW = avail * 45 / 100, optW = avail - devW;
+    const RECT dev = {m, y, m + devW, y + cardH};
+    const RECT opt = {dev.right + gap, y, dev.right + gap + optW, y + cardH};
+    app.mouseCard = {opt.right + gap, y, W - m, y + cardH};
+    app.cards.push_back({dev, L"OUTPUT DEVICE"});
+    app.cards.push_back({opt, L"OPTIONS"});
+    app.cards.push_back({app.mouseCard, L"MOUSE"});
 
-    // device + options cards
-    y += app.S(88) + app.S(12);
-    const int cardH = app.S(272), half = (W - 2 * m - app.S(12)) / 2;
-    const int lx = m, rx = m + half + app.S(12);
-    app.cards.push_back({{lx, y, lx + half, y + cardH}, L"OUTPUT DEVICE"});
-    app.cards.push_back({{rx, y, rx + half, y + cardH}, L"OPTIONS"});
+    int inner = devW - 2 * pad;
+    place(IDC_DEVICE, dev.left + pad, y + app.S(42), inner, fh);
+    const int baudW = app.S(84), testW = app.S(76);
+    const int portW = inner - baudW - testW - 2 * g8;
+    app.labels.push_back({{dev.left + pad + app.S(2), y + app.S(86), dev.left + pad + portW, y + app.S(104)}, L"Port"});
+    app.labels.push_back({{dev.left + pad + portW + g8 + app.S(2), y + app.S(86), dev.right, y + app.S(104)}, L"Baud"});
+    field(IDC_PORT, dev.left + pad, y + app.S(106), portW, app.S(30));
+    const RECT pf = app.fields[IDC_PORT];
+    place(IDC_PORT_MENU, pf.right - app.S(34), pf.top + app.S(3), app.S(31), fh - app.S(6));
+    field(IDC_BAUD, pf.right + g8, pf.top, baudW);
+    place(IDC_TEST, pf.right + g8 + baudW + g8, pf.top, testW, fh);
+    app.helpRect = {dev.left + pad, y + app.S(156), dev.right - pad, dev.bottom - pad};
 
-    const int inner = half - 2 * pad;
-    place(IDC_DEVICE, lx + pad, y + app.S(38), inner, fh);
-    app.hintRect = {lx + pad + app.S(2), y + app.S(78), lx + half - pad, y + app.S(96)};
-    const int baudW = app.S(96), testW = app.S(72);
-    const int portW = inner - baudW - testW - 2 * gap;
-    app.labels.push_back({{lx + pad + app.S(2), y + app.S(104), lx + pad + portW, y + app.S(122)}, L"Port"});
-    app.labels.push_back({{lx + pad + portW + gap + app.S(2), y + app.S(104), lx + pad + portW + gap + baudW, y + app.S(122)},
-                          L"Baud"});
-    field(IDC_PORT, lx + pad, y + app.S(126), portW, app.S(34));
-    RECT pf = app.fields[IDC_PORT];
-    place(IDC_PORT_MENU, pf.right - app.S(36), pf.top + app.S(3), app.S(33), fh - app.S(6));
-    field(IDC_BAUD, pf.right + gap, pf.top, baudW);
-    place(IDC_TEST, pf.right + gap + baudW + gap, pf.top, testW, fh);
-    app.labels.push_back({{lx + pad + app.S(2), y + app.S(176), lx + half - pad, y + app.S(194)},
-                          L"Mouse buttons (live while a script runs)"});
-    app.buttonsRect = {lx + pad, y + app.S(200), lx + half - pad, y + app.S(232)};
-
-    // options: one setting per row, label on the left, control on the right
-    const int labelW = app.S(150), cx = rx + pad + labelW, cw = inner - labelW;
-    auto row = [&](int i) { return y + app.S(36) + i * app.S(46); };
-    place(IDC_KEYFALLBACK, rx + pad, row(0) + app.S(3), inner, app.S(30));
-    place(IDC_AUTOSTART, rx + pad, row(1) + app.S(3), inner, app.S(30));
-    app.labels.push_back({{rx + pad + app.S(2), row(2), cx - gap, row(2) + fh}, L"F13–F24 keys"});
+    inner = optW - 2 * pad;
+    const int labelW = app.S(140), cx = opt.left + pad + labelW, cw = inner - labelW;
+    auto row = [&](int i) { return y + app.S(40) + i * app.S(42); };
+    place(IDC_KEYFALLBACK, opt.left + pad, row(0) + app.S(2), inner, app.S(30));
+    place(IDC_AUTOSTART, opt.left + pad, row(1) + app.S(2), inner, app.S(30));
+    app.labels.push_back({{opt.left + pad + app.S(2), row(2), cx - g8, row(2) + fh}, L"F13–F24 keys"});
     place(IDC_EXTRA, cx, row(2), cw, fh);
-    app.labels.push_back({{rx + pad + app.S(2), row(3), cx - gap, row(3) + fh}, L"Start/stop hotkey"});
+    app.labels.push_back({{opt.left + pad + app.S(2), row(3), cx - g8, row(3) + fh}, L"Start/stop hotkey"});
     place(IDC_HOTKEY, cx, row(3), cw, fh);
-    const int jw = (cw - 2 * app.S(18) - gap) / 2, jl = app.S(18);
-    app.labels.push_back({{rx + pad + app.S(2), row(4), cx - gap, row(4) + fh}, L"Randomize (\u00B1 px)"});
-    app.labels.push_back({{cx, row(4), cx + jl, row(4) + fh}, L"X"});
-    field(IDC_JITTER_X, cx + jl, row(4), jw);
-    app.labels.push_back({{cx + jl + jw + gap, row(4), cx + 2 * jl + jw + gap, row(4) + fh}, L"Y"});
-    field(IDC_JITTER_Y, cx + 2 * jl + jw + gap, row(4), jw);
+    const int jl = app.S(34), jw = (cw - 2 * jl - g8) / 2;
+    app.labels.push_back({{opt.left + pad + app.S(2), row(4), cx - g8, row(4) + fh}, L"Randomize (px)"});
+    app.labels.push_back({{cx, row(4), cx + jl, row(4) + fh}, L"Min"});
+    field(IDC_JITTER_MIN, cx + jl, row(4), jw);
+    app.labels.push_back({{cx + jl + jw + g8, row(4), cx + 2 * jl + jw + g8, row(4) + fh}, L"Max"});
+    field(IDC_JITTER_MAX, cx + 2 * jl + jw + g8, row(4), jw);
 
-    // log card
-    y += cardH + app.S(12);
-    app.cards.push_back({{m, y, W - m, H - m}, L"LOG"});
-    place(IDC_CLEAR, W - m - pad - app.S(72), y + app.S(8), app.S(72), app.S(28));
-    app.fields[IDC_LOG] = {m + pad, y + app.S(42), W - m - pad, H - m - pad};
-    place(IDC_LOG, m + pad + app.S(10), y + app.S(50), W - 2 * m - 2 * pad - app.S(14), H - m - pad - y - app.S(56));
+    app.mouseArea = {app.mouseCard.left + app.S(12), y + app.S(34), app.mouseCard.right - app.S(12),
+                     app.mouseCard.bottom - app.S(36)};
+    app.legendRect = {app.mouseCard.left + app.S(12), app.mouseCard.bottom - app.S(38), app.mouseCard.right - app.S(12),
+                      app.mouseCard.bottom - app.S(14)};
 
-    // controls were moved without repainting; redraw them all at their new size
-    RedrawWindow(app.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    // log
+    const int ly = y + cardH + gap;
+    app.cards.push_back({{m, ly, W - m, H - m}, L"LOG"});
+    place(IDC_CLEAR, W - m - pad - app.S(84), ly + app.S(8), app.S(84), app.S(28));
+    app.fields[IDC_LOG] = {m + pad, ly + app.S(42), W - m - pad, H - m - pad};
+    place(IDC_LOG, m + pad + app.S(10), ly + app.S(50), W - 2 * m - 2 * pad - app.S(14), H - m - pad - ly - app.S(56));
+
+    // controls were moved without repainting; redraw everything at the new size
+    redrawAll();
 }
 
 // ------------------------------------------------------------------ window setup
@@ -980,6 +1681,8 @@ LRESULT CALLBACK buttonHover(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, D
     } else if (msg == WM_MOUSELEAVE && app.hover == h) {
         app.hover = nullptr;
         InvalidateRect(h, nullptr, FALSE);
+    } else if (msg == WM_ERASEBKGND) {
+        return 1;
     }
     return DefSubclassProc(h, msg, wp, lp);
 }
@@ -991,9 +1694,9 @@ HWND make(const wchar_t* cls, const wchar_t* label, DWORD style, int id, HFONT f
     return h;
 }
 
-void button(int id, const wchar_t* label, Role role) {
+void button(int id, const wchar_t* label, Role role, Icon icon = Icon::None) {
     HWND h = make(L"BUTTON", label, BS_OWNERDRAW, id);
-    app.roles[id] = role;
+    app.buttons[id] = {role, icon};
     SetWindowSubclass(h, buttonHover, 0, 0);
 }
 
@@ -1019,13 +1722,11 @@ bool fontExists(const wchar_t* face) {
 }
 
 void enableDarkChrome() {
-    // dark title bar (Windows 10 1809+ / 11) and caption colour on Windows 11
     BOOL on = TRUE;
     if (FAILED(DwmSetWindowAttribute(app.wnd, 20, &on, sizeof(on)))) DwmSetWindowAttribute(app.wnd, 19, &on, sizeof(on));
-    COLORREF caption = Color::bg;
-    DwmSetWindowAttribute(app.wnd, 35, &caption, sizeof(caption));
-    // dark scrollbars and popup menus where Windows supports it
-    SetWindowTheme(app.item(IDC_LOG), L"DarkMode_Explorer", nullptr);
+    const int corner = 2;  // DWMWCP_ROUND on Windows 11
+    DwmSetWindowAttribute(app.wnd, 33, &corner, sizeof(corner));
+    // dark scrollbars and tooltips where Windows supports it
     using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
     OSVERSIONINFOW v = {sizeof(v)};
     if (auto rtl = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")))
@@ -1036,44 +1737,44 @@ void enableDarkChrome() {
             if (auto fn = reinterpret_cast<SetPreferredAppMode>(GetProcAddress(ux, MAKEINTRESOURCEA(135)))) fn(2);
         }
     }
+    SetWindowTheme(app.item(IDC_LOG), L"DarkMode_Explorer", nullptr);
 }
 
 void createControls() {
-    app.font = makeFont(14, FW_NORMAL, L"Segoe UI");
-    app.fontBold = makeFont(14, FW_SEMIBOLD, L"Segoe UI");
-    app.fontSmall = makeFont(12, FW_SEMIBOLD, L"Segoe UI");
-    app.fontTitle = makeFont(22, FW_SEMIBOLD, L"Segoe UI");
-    app.fontMono = makeFont(13, FW_NORMAL, L"Cascadia Mono");
-    if (!fontExists(L"Cascadia Mono")) {
-        DeleteObject(app.fontMono);
-        app.fontMono = makeFont(13, FW_NORMAL, L"Consolas");
-    }
+    const wchar_t* ui = fontExists(L"Segoe UI Variable Text") ? L"Segoe UI Variable Text" : L"Segoe UI";
+    const wchar_t* display = fontExists(L"Segoe UI Variable Display") ? L"Segoe UI Variable Display" : L"Segoe UI";
+    app.font = makeFont(14, FW_NORMAL, ui);
+    app.fontBold = makeFont(14, FW_SEMIBOLD, ui);
+    app.fontSmall = makeFont(12, FW_SEMIBOLD, ui);
+    app.fontCaption = makeFont(11, FW_BOLD, ui);
+    app.fontTiny = makeFont(10, FW_BOLD, ui);
+    app.fontTitle = makeFont(14, FW_SEMIBOLD, ui);
+    app.fontHero = makeFont(28, FW_SEMIBOLD, display);
+    app.monoFace = fontExists(L"Cascadia Mono") ? L"Cascadia Mono" : L"Consolas";
+    app.fontMono = makeFont(13, FW_NORMAL, app.monoFace.c_str());
     app.fieldBrush = CreateSolidBrush(Color::field);
-    app.logBrush = CreateSolidBrush(Color::logBg);
 
-    button(IDC_STOP, L"Stop", Role::Danger);
-    button(IDC_START, L"Start", Role::Primary);
-    button(IDC_OPEN, L"Open script", Role::Secondary);
-    button(IDC_LOADCFG, L"Load config", Role::Secondary);
-    button(IDC_SAVECFG, L"Save config", Role::Secondary);
-    button(IDC_SAVEAS, L"Save as…", Role::Secondary);
-    button(IDC_EDIT, L"Edit script", Role::Secondary);
-    button(IDC_RELOAD, L"Reload", Role::Secondary);
-    make(L"EDIT", L"", ES_AUTOHSCROLL, IDC_SCRIPT);
-    button(IDC_SCRIPT_MENU, L"", Role::Chevron);
-    button(IDC_BROWSE, L"Browse…", Role::Secondary);
+    button(IDC_MIN, L"", Role::Caption, Icon::Minimize);
+    button(IDC_MAX, L"", Role::Caption, Icon::Maximize);
+    button(IDC_CLOSE, L"", Role::CaptionClose, Icon::Close);
+    button(IDC_CONFIG, L"", Role::Chip);
+    button(IDC_START, L"", Role::Hero);
+    button(IDC_OPEN, L"Open", Role::Ghost, Icon::Folder);
+    button(IDC_LIBRARY, L"Scripts", Role::Ghost, Icon::List);
+    button(IDC_EDIT, L"Edit", Role::Ghost, Icon::Edit);
+    button(IDC_RELOAD, L"Reload", Role::Ghost, Icon::Reload);
     button(IDC_DEVICE, L"", Role::Dropdown);
     make(L"EDIT", L"", ES_AUTOHSCROLL, IDC_PORT);
     button(IDC_PORT_MENU, L"", Role::Chevron);
     make(L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL, IDC_BAUD);
-    button(IDC_TEST, L"Test", Role::Secondary);
+    button(IDC_TEST, L"Test", Role::Secondary, Icon::Pointer);
     button(IDC_KEYFALLBACK, L"Type keys in software when the device can't", Role::Toggle);
-    button(IDC_EXTRA, L"", Role::Dropdown);
     button(IDC_AUTOSTART, L"Start the script when the app opens", Role::Toggle);
-    make(L"EDIT", L"0", ES_NUMBER | ES_AUTOHSCROLL, IDC_JITTER_X);
-    make(L"EDIT", L"0", ES_NUMBER | ES_AUTOHSCROLL, IDC_JITTER_Y);
+    button(IDC_EXTRA, L"", Role::Dropdown);
     button(IDC_HOTKEY, L"", Role::Dropdown);
-    button(IDC_CLEAR, L"Clear", Role::Secondary);
+    make(L"EDIT", L"0", ES_AUTOHSCROLL, IDC_JITTER_MIN);
+    make(L"EDIT", L"0", ES_AUTOHSCROLL, IDC_JITTER_MAX);
+    button(IDC_CLEAR, L"Clear", Role::Ghost, Icon::Trash);
 
     // colour-coded log (rich edit)
     LoadLibraryW(L"Msftedit.dll");
@@ -1086,35 +1787,37 @@ void createControls() {
     cf.crTextColor = logColor(LogKind::Script);
     cf.yHeight = 13 * 72 * 20 / 96;  // 13 px in twips
     cf.bCharSet = DEFAULT_CHARSET;
-    lstrcpynW(cf.szFaceName, fontExists(L"Cascadia Mono") ? L"Cascadia Mono" : L"Consolas", LF_FACESIZE);
+    lstrcpynW(cf.szFaceName, app.monoFace.c_str(), LF_FACESIZE);
     SendMessageW(log, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
 
-    const int m = app.S(4);
-    for (int id : {IDC_SCRIPT, IDC_PORT, IDC_BAUD, IDC_JITTER_X, IDC_JITTER_Y}) SendMessageW(app.item(id), EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
-    SendMessageW(log, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(m, m));
-    SendMessageW(app.item(IDC_SCRIPT), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Pick a .lua script"));
+    for (int id : {IDC_PORT, IDC_BAUD, IDC_JITTER_MIN, IDC_JITTER_MAX})
+        SendMessageW(app.item(id), EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(0, 0));
+    for (int id : {IDC_JITTER_MIN, IDC_JITTER_MAX}) SendMessageW(app.item(id), EM_SETLIMITTEXT, 6, 0);
+    SendMessageW(log, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(app.S(4), app.S(4)));
     SendMessageW(app.item(IDC_PORT), EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"e.g. COM5"));
 
     // tooltips with the keyboard shortcuts
-    app.tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-                                  0, 0, 0, 0, app.wnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+    app.tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, 0, 0,
+                                  0, 0, app.wnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     SetWindowTheme(app.tooltip, L"DarkMode_Explorer", nullptr);
     SendMessageW(app.tooltip, TTM_SETMAXTIPWIDTH, 0, app.S(360));
     const struct { int id; const wchar_t* tip; } tips[] = {
-        {IDC_START, L"Start the script (F5)"},
-        {IDC_STOP, L"Stop the script (Shift+F5)"},
+        {IDC_START, L"Start the script (F5) / stop it (Shift+F5)"},
         {IDC_OPEN, L"Open a .lua script (Ctrl+O)"},
-        {IDC_LOADCFG, L"Load a saved config (Ctrl+L)"},
-        {IDC_SAVECFG, L"Save the settings to the current config (Ctrl+S)"},
-        {IDC_SAVEAS, L"Save the settings as a new config (Ctrl+Shift+S)"},
+        {IDC_LIBRARY, L"Scripts in the scripts\\ and examples\\ folders next to the app"},
         {IDC_EDIT, L"Open the script in your text editor (Ctrl+E)"},
         {IDC_RELOAD, L"Restart the script after editing it (Ctrl+R)"},
-        {IDC_SCRIPT_MENU, L"Scripts in the scripts\\ and examples\\ folders next to the app"},
+        {IDC_CONFIG, L"Save, save as or load a config"},
         {IDC_PORT_MENU, L"Serial ports that are plugged in right now"},
         {IDC_TEST, L"Wiggle the pointer through the device to check that it works"},
         {IDC_HOTKEY, L"Starts and stops the script from anywhere, even while another app is in front"},
         {IDC_EXTRA, L"Bind your mouse's extra buttons to F13–F24 in its own software, then pick what they do here"},
+        {IDC_JITTER_MIN, L"Each mouse movement lands between Min and Max pixels off the exact path (decimals allowed, 0 = off)"},
+        {IDC_JITTER_MAX, L"Each mouse movement lands between Min and Max pixels off the exact path (decimals allowed, 0 = off)"},
         {IDC_CLEAR, L"Clear the log"},
+        {IDC_MIN, L"Minimize"},
+        {IDC_MAX, L"Maximize"},
+        {IDC_CLOSE, L"Close"},
     };
     for (const auto& t : tips) {
         TTTOOLINFOW ti = {};
@@ -1127,68 +1830,94 @@ void createControls() {
     }
 
     ACCEL keys[] = {
-        {FCONTROL | FVIRTKEY, 'O', IDC_OPEN},       {FCONTROL | FVIRTKEY, 'L', IDC_LOADCFG},
-        {FCONTROL | FVIRTKEY, 'S', IDC_SAVECFG},    {FCONTROL | FSHIFT | FVIRTKEY, 'S', IDC_SAVEAS},
-        {FVIRTKEY, VK_F5, IDC_START},               {FSHIFT | FVIRTKEY, VK_F5, IDC_STOP},
-        {FCONTROL | FVIRTKEY, 'R', IDC_RELOAD},     {FCONTROL | FVIRTKEY, 'E', IDC_EDIT},
+        {FCONTROL | FVIRTKEY, 'O', IDC_OPEN},    {FCONTROL | FVIRTKEY, 'L', IDC_LOADCFG},
+        {FCONTROL | FVIRTKEY, 'S', IDC_SAVECFG}, {FCONTROL | FSHIFT | FVIRTKEY, 'S', IDC_SAVEAS},
+        {FVIRTKEY, VK_F5, IDC_START},            {FSHIFT | FVIRTKEY, VK_F5, IDC_STOP},
+        {FCONTROL | FVIRTKEY, 'R', IDC_RELOAD},  {FCONTROL | FVIRTKEY, 'E', IDC_EDIT},
     };
     app.accel = CreateAcceleratorTableW(keys, sizeof(keys) / sizeof(keys[0]));
 }
 
 void onCommand(int id, int code) {
-    // accelerators arrive for disabled buttons too
-    if (code == 1 && !IsWindowEnabled(app.item(id))) return;
+    // shortcuts arrive for disabled buttons too
+    HWND ctl = app.item(id);
+    if (code == 1 && ctl && !IsWindowEnabled(ctl)) return;
     switch (id) {
-        case IDC_START: startScript(); break;
-        case IDC_STOP: stopScript(); break;
+        case IDC_START:
+            if (app.running()) {
+                if (code != 1) stopScript();  // F5 only starts; the button toggles
+            } else {
+                startScript();
+            }
+            break;
+        case IDC_STOP:
+            if (app.running()) stopScript();
+            break;
         case IDC_RELOAD:
             if (app.running()) {
                 stopScript();
                 startScript();
             }
             break;
-        case IDC_OPEN:
-        case IDC_BROWSE: openScript(); break;
-        case IDC_LOADCFG: {
-            const std::string path = fileDialog(false, L"Bridge config (*.ini)\0*.ini\0All files (*.*)\0*.*\0",
-                                                app.configPath.empty() ? ensureDir("configs") : dirName(app.configPath),
-                                                "", L"ini");
-            if (!path.empty()) loadConfigFile(path);
+        case IDC_OPEN: openScript(); break;
+        case IDC_LIBRARY: libraryMenu(); break;
+        case IDC_LOADCFG:
+            if (!app.running()) loadConfigDialog();
             break;
-        }
         case IDC_SAVECFG: saveConfigFile(); break;
         case IDC_SAVEAS: saveConfigAs(); break;
+        case IDC_CONFIG: configMenu(); break;
         case IDC_EDIT: editScript(); break;
-        case IDC_SCRIPT_MENU: scriptMenu(); break;
         case IDC_PORT_MENU: portMenu(); break;
         case IDC_DEVICE: deviceMenu(); break;
         case IDC_EXTRA: extraMenu(); break;
         case IDC_HOTKEY: hotkeyMenu(); break;
         case IDC_TEST: testDevice(); break;
         case IDC_CLEAR: clearLog(); break;
-        case IDC_KEYFALLBACK:
-            app.keyFallback = !app.keyFallback;
-            InvalidateRect(app.item(id), nullptr, FALSE);
-            refreshChrome();
-            break;
-        case IDC_AUTOSTART:
-            app.autoStart = !app.autoStart;
-            InvalidateRect(app.item(id), nullptr, FALSE);
-            refreshChrome();
-            break;
-        case IDC_SCRIPT:
+        case IDC_KEYFALLBACK: toggle(id, app.keyFallback); break;
+        case IDC_AUTOSTART: toggle(id, app.autoStart); break;
+        case IDC_MIN: ShowWindow(app.wnd, SW_MINIMIZE); break;
+        case IDC_MAX: ShowWindow(app.wnd, IsZoomed(app.wnd) ? SW_RESTORE : SW_MAXIMIZE); break;
+        case IDC_CLOSE: PostMessageW(app.wnd, WM_CLOSE, 0, 0); break;
         case IDC_PORT:
         case IDC_BAUD:
-        case IDC_JITTER_X:
-        case IDC_JITTER_Y:
+        case IDC_JITTER_MIN:
+        case IDC_JITTER_MAX:
             if (code == EN_CHANGE) refreshChrome();
-            if (code == EN_SETFOCUS || code == EN_KILLFOCUS) InvalidateRect(app.wnd, &app.fields[id], FALSE);
+            if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
+                app.backdropDirty = true;  // the focus ring is part of the backdrop
+                RECT r = app.fields[id];
+                InflateRect(&r, app.S(2), app.S(2));
+                RedrawWindow(app.wnd, &r, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+            }
             break;
     }
 }
 
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_NCCALCSIZE:
+            // draw our own title bar: drop the caption, keep the resize frame on the other sides
+            if (wp) {
+                auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+                const int fx = GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                const int fy = GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+                p->rgrc[0].left += fx;
+                p->rgrc[0].right -= fx;
+                p->rgrc[0].bottom -= fy;
+                if (IsZoomed(hwnd)) p->rgrc[0].top += fy;
+                return 0;
+            }
+            break;
+        case WM_NCHITTEST: {
+            const LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+            if (hit != HTCLIENT) return hit;
+            POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            if (!IsZoomed(hwnd) && pt.y < app.S(5)) return HTTOP;
+            if (pt.y < app.titleH) return HTCAPTION;
+            return HTCLIENT;
+        }
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT: {
@@ -1203,7 +1932,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_GETMINMAXINFO: {
             auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-            mm->ptMinTrackSize = {app.S(780), app.S(700)};
+            mm->ptMinTrackSize = {app.S(1000), app.S(690)};
             return 0;
         }
         case WM_DRAWITEM:
@@ -1212,10 +1941,9 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(wp);
-            const bool isLog = reinterpret_cast<HWND>(lp) == app.item(IDC_LOG);
-            SetTextColor(dc, isLog ? RGB(0xc9, 0xd1, 0xd9) : IsWindowEnabled(reinterpret_cast<HWND>(lp)) ? Color::text : Color::muted);
-            SetBkColor(dc, isLog ? Color::logBg : Color::field);
-            return reinterpret_cast<LRESULT>(isLog ? app.logBrush : app.fieldBrush);
+            SetTextColor(dc, IsWindowEnabled(reinterpret_cast<HWND>(lp)) ? Color::text : Color::faint);
+            SetBkColor(dc, Color::field);
+            return reinterpret_cast<LRESULT>(app.fieldBrush);
         }
         case WM_COMMAND:
             onCommand(LOWORD(wp), HIWORD(wp));
@@ -1225,25 +1953,33 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (DragQueryFileW(reinterpret_cast<HDROP>(wp), 0, file, MAX_PATH) && !app.running()) {
                 const std::string path = narrow(file);
                 if (path.size() > 4 && _stricmp(path.c_str() + path.size() - 4, ".ini") == 0) loadConfigFile(path);
-                else SetWindowTextW(app.item(IDC_SCRIPT), file);
+                else setScript(path);
             }
             DragFinish(reinterpret_cast<HDROP>(wp));
             return 0;
         }
-        case WM_TIMER: {
-            flushLog();
-            unsigned bits = app.engine ? 0u : 0x400u;  // repaint the indicator only when it changes
-            for (int i = 0; i < 5 && app.engine; i++) {
-                bool phys, script;
-                app.engine->buttonState(i + 1, phys, script);
-                bits |= (phys ? 1u : 0u) << i | (script ? 1u : 0u) << (i + 5);
-            }
-            if (bits != app.lastButtons) {
-                app.lastButtons = bits;
-                InvalidateRect(hwnd, &app.buttonsRect, FALSE);
+        case WM_TIMER:
+            if (wp == kLogTimer) {
+                flushLog();
+                unsigned bits = app.engine ? 0u : 0x400u;  // repaint the mouse only when something changed
+                for (int i = 0; i < 5 && app.engine; i++) {
+                    bool phys, script;
+                    app.engine->buttonState(i + 1, phys, script);
+                    bits |= (phys ? 1u : 0u) << i | (script ? 1u : 0u) << (i + 5);
+                }
+                if (bits != app.lastButtons) {
+                    app.lastButtons = bits;
+                    InvalidateRect(hwnd, &app.mouseCard, FALSE);
+                }
+            } else if (wp == kAnimTimer) {
+                if (app.running()) InvalidateRect(hwnd, &app.ringRect, FALSE);
+                for (auto it = app.anims.begin(); it != app.anims.end();) {
+                    InvalidateRect(app.item(it->first), nullptr, FALSE);
+                    if (GetTickCount() - it->second.start > 200) it = app.anims.erase(it);
+                    else ++it;
+                }
             }
             return 0;
-        }
         case WM_HOTKEY:
             if (wp == kHotkeyId) {
                 if (app.running()) stopScript();
@@ -1306,7 +2042,7 @@ void loadState(const std::wstring& arg) {
     if (!arg.empty()) {
         const std::string a = narrow(arg);
         if (a.size() > 4 && _stricmp(a.c_str() + a.size() - 4, ".ini") == 0) loadConfigFile(a);
-        else SetWindowTextW(app.item(IDC_SCRIPT), arg.c_str());
+        else setScript(a);
     }
 }
 
@@ -1344,11 +2080,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     // default size, shrunk to fit small screens
     RECT work;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-    const int winW = std::min<int>(app.S(860), work.right - work.left);
-    const int winH = std::min<int>(app.S(830), work.bottom - work.top);
+    const int winW = std::min<int>(app.S(1080), work.right - work.left);
+    const int winH = std::min<int>(app.S(800), work.bottom - work.top);
     app.wnd = CreateWindowExW(WS_EX_CONTROLPARENT, wc.lpszClassName, L"Logitech Script Bridge",
                               WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, work.left + (work.right - work.left - winW) / 2,
                               work.top + (work.bottom - work.top - winH) / 2, winW, winH, nullptr, nullptr, inst, nullptr);
+    SetWindowPos(app.wnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
     createControls();
     enableDarkChrome();
     loadState(arg);
@@ -1357,8 +2094,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     restoreWindow(show);
     DragAcceptFiles(app.wnd, TRUE);
     SetTimer(app.wnd, kLogTimer, 50, nullptr);
+    SetTimer(app.wnd, kAnimTimer, 30, nullptr);
     app.log("Pick a script, choose your device and press Start (F5). Hover over a button to see its shortcut.\n");
-    if (app.autoStart && !getText(IDC_SCRIPT).empty()) PostMessageW(app.wnd, WM_COMMAND, IDC_START, 0);
+    if (app.autoStart && !app.scriptPath.empty()) PostMessageW(app.wnd, WM_COMMAND, IDC_START, 0);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

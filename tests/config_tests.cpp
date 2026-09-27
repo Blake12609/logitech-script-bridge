@@ -50,8 +50,8 @@ TEST(config_roundtrip_with_relative_script) {
     c.keyFallback = false;
     c.extraKeys = "gkeys";
     c.autoStart = true;
-    c.jitterX = 3;
-    c.jitterY = 2;
+    c.jitterMin = 1.5;
+    c.jitterMax = 4;
     c.hotkey = "f8";
     std::string err;
     const std::string path = joinPath(dir, "game.ini");
@@ -111,12 +111,24 @@ TEST(config_extras_defaults_and_bad_input) {
     CHECK(c.baud == 115200);
     CHECK(!c.keyFallback);
     CHECK(c.extraKeys == "off");
-    CHECK(c.jitterX == 0 && c.jitterY == 0 && c.hotkey == "off");
+    CHECK(c.jitterMin == 0 && c.jitterMax == 0 && c.hotkey == "off");
     CHECK(extras["config_file"] == "x.ini");
 
     Config missing;
     CHECK(!loadConfig(joinPath(dir, "does_not_exist.ini"), missing, err));
     CHECK(!err.empty());
+}
+
+TEST(config_reads_old_jitter_settings) {
+    // configs from v1.2/v1.3 stored "up to +-N px" per axis
+    const std::string path = joinPath(tempDir(), "old.ini");
+    FILE* f = openUtf8(path, "wb");
+    std::fputs("[bridge]\njitter_x=3\njitter_y=2\n", f);
+    std::fclose(f);
+    Config c;
+    std::string err;
+    CHECK(loadConfig(path, c, err));
+    CHECK(c.jitterMin == 0 && c.jitterMax == 3);
 }
 
 TEST(path_helpers) {

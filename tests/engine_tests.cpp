@@ -1,5 +1,7 @@
 // Engine tests: run Lua scripts against a dry-run device and fake input.
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <functional>
 #include <mutex>
@@ -285,35 +287,60 @@ TEST(g_keys) {
     CHECK(h.logHas("G_PRESSED 3 kb\nG_RELEASED 3 kb"));
 }
 
-TEST(jitter_wobbles_around_the_path) {
+// Runs 500 one-pixel moves to the right and returns how far off the exact path each step landed.
+std::vector<double> jitterDistances(double minPx, double maxPx, bool* varied) {
     DryRunBackend backend;
     NullInput input;
     Engine engine(backend, input, [](const std::string&) {});
-    engine.setJitter(3, 2, 1234);
+    engine.setJitter(minPx, maxPx, 1234);
     std::string err;
-    CHECK(engine.start(R"(
+    engine.start(R"(
     function OnEvent(e)
         if e == "PROFILE_ACTIVATED" then
             for i = 1, 500 do MoveMouseRelative(1, 0) end
         end
-    end)", "jitter.lua", err));
+    end)", "jitter.lua", err);
     Harness::settle(200);
     engine.stop();
-    int x = 0, y = 0, steps = 0;
-    bool varied = false, inRange = true;
+    std::vector<double> dist;
+    int x = 0, y = 0;
+    *varied = false;
     for (const auto& line : backend.sent()) {
         int dx = 0, dy = 0;
         if (std::sscanf(line.c_str(), "move %d %d", &dx, &dy) != 2) continue;
         x += dx;
         y += dy;
-        steps++;
-        if (dx != 1 || dy != 0) varied = true;
-        // never further than the range from where the script thinks the pointer is
-        if (x < steps - 3 || x > steps + 3 || y < -2 || y > 2) inRange = false;
+        if (dx != 1 || dy != 0) *varied = true;
+        const double ox = x - static_cast<double>(dist.size() + 1), oy = y;  // offset from the exact spot
+        dist.push_back(std::sqrt(ox * ox + oy * oy));
     }
-    CHECK(steps == 500);  // the dry-run device records (0,0) moves too
+    return dist;
+}
+
+TEST(jitter_stays_within_min_max) {
+    bool varied = false;
+    const auto dist = jitterDistances(1.0, 4.0, &varied);
+    CHECK(dist.size() == 500);
     CHECK(varied);
-    CHECK(inRange);
+    double lo = 1e9, hi = 0, sum = 0;
+    for (double d : dist) {
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+        sum += d;
+    }
+    // whole-pixel rounding can shift the distance by up to ~0.71 px
+    CHECK(lo >= 1.0 - 0.71);
+    CHECK(hi <= 4.0 + 0.71);
+    CHECK(sum / dist.size() > 1.8 && sum / dist.size() < 3.2);  // spread across the range, no drift
+}
+
+TEST(jitter_decimals_and_swapped_range) {
+    bool varied = false;
+    auto dist = jitterDistances(2.5, 1.5, &varied);  // min/max given the wrong way round
+    CHECK(varied);
+    for (double d : dist) CHECK(d >= 1.5 - 0.71 && d <= 2.5 + 0.71);
+    dist = jitterDistances(0.2, 0.6, &varied);  // sub-pixel: mostly 0 or 1 px off
+    for (double d : dist) CHECK(d <= 0.6 + 0.71);
 }
 
 TEST(jitter_off_is_exact) {

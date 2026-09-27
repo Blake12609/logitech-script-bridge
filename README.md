@@ -62,7 +62,7 @@ with Windows `SendInput` instead. You can turn that off.
 Any other device that speaks the MAKCU/KMBox `km.move(x,y)` / `km.left(1)` serial
 protocol should work with the MAKCU or KMBox setting.
 
-<p align="center"><img src="docs/devices.png" width="560" alt="device picker"></p>
+<p align="center"><img src="docs/devices.png" width="760" alt="device picker"></p>
 
 ## Quick start
 
@@ -78,8 +78,10 @@ The window remembers its size and position.
 
 ### Save and load configs
 
-A config remembers the script, device, port and options. Use **Save config** (Ctrl+S), **Save as…**
-(Ctrl+Shift+S) and **Load config** (Ctrl+L). You can also drop a `.ini` file on the window.
+A config remembers the script, device, port and options. Click the config button in the title bar
+(it shows the current config's name) for **Save** (Ctrl+S), **Save as…** (Ctrl+Shift+S) and **Load…** (Ctrl+L).
+You can also drop a `.ini` file on the window. The dot on that button is green when saved and blue when
+there are unsaved changes.
 Configs go to a `configs\` folder next to the exe by default. Scripts stored next to them are
 saved as relative paths, so you can move the whole folder or carry it on a USB stick.
 The title bar shows `*` when the settings differ from the loaded config.
@@ -91,30 +93,20 @@ Turn on **Start the script when the app opens** and the app is ready to go as so
 Pick a **Start/stop hotkey** (F6–F12, Pause or Scroll Lock) to start and stop the script from
 anywhere, even while a game or Paint is in front. While it's set, that key is reserved for the app.
 
-### Live button indicator
+### Live mouse view
 
-The **Mouse buttons** row lights up as you press buttons while a script runs: filled means pressed on
-your mouse, outlined means held by the script. It's also a quick way to see which number
-(`OnEvent` arg) each button has.
+The **Mouse** card shows a mouse whose buttons light up while a script runs: filled means pressed on
+your mouse, outlined means held by the script. It also shows which number (`OnEvent` arg) each
+button has.
 
 ### Randomize movement
 
-**Randomize movement (± px)** adds a small random offset of up to X pixels sideways and Y pixels
-up/down to every mouse movement the script makes. That gives drawing scripts in Paint and similar
-apps a hand-drawn look. The pointer wobbles around the path the script asked for and never drifts
-further than X / Y away from it, even over long strokes. Set both to 0 (the default) for exact
-movement. Try [`examples/paint_draw_line.lua`](examples/paint_draw_line.lua) with X 3, Y 2.
-
-### Mice with more than five buttons
-
-G HUB reports buttons 6 and up for Logitech mice with extra buttons. Windows only
-reports five, so the app has a workaround: in your mouse's own software, bind the
-extra buttons to the keys **F13–F24**. Then set *F13–F24 keys* to:
-
-- **Extra mouse buttons 6–17**: F13 becomes button 6, F14 becomes button 7, and so on (`MOUSE_BUTTON_PRESSED`, `IsMouseButtonPressed(6)`).
-- **G-keys G1–G12**: F13 becomes G1 and so on (`G_PRESSED` / `G_RELEASED`, family `"kb"`).
-
-While a script runs, those keys go to the script instead of other programs.
+**Randomize (px)** takes a **Min** and **Max** distance in pixels (decimals allowed, e.g. 0.5 to 2.5).
+Every mouse movement the script makes then lands between Min and Max pixels away from where
+the script asked, in a random direction. That gives drawing scripts in Paint and similar apps a
+hand-drawn look. The pointer wobbles around the path the script asked for and never drifts away from it,
+even over long strokes. Set Max to 0 (the default) for exact movement.
+Try [`examples/paint_draw_line.lua`](examples/paint_draw_line.lua) with Min 1, Max 4.
 
 ## How scripts behave (same as G HUB)
 

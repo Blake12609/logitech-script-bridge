@@ -52,10 +52,11 @@ public:
 
     static constexpr int kMaxButton = 32;
 
-    // Randomize every mouse movement the script makes by up to +-x / +-y counts
-    // (0 = off), e.g. for a hand-drawn look. The pointer wobbles around the path
-    // the script asked for instead of drifting away from it. Call before start().
-    void setJitter(int x, int y, unsigned seed = std::random_device{}());
+    // Randomize every mouse movement the script makes, e.g. for a hand-drawn look:
+    // each move lands between minPx and maxPx pixels (decimals allowed) away from
+    // where the script asked, in a random direction. The pointer wobbles around the
+    // path instead of drifting away from it. maxPx 0 = off. Call before start().
+    void setJitter(double minPx, double maxPx, unsigned seed = std::random_device{}());
 
     // Button n (OnEvent numbering 1-5): held on the real mouse / held by the script.
     void buttonState(int n, bool& physical, bool& script);
@@ -79,7 +80,7 @@ private:
     void sleepMs(double ms);
     Backend* keyOutput();
     void moveWithJitter(int dx, int dy);
-    int pickJitter(int range);
+    void pickOffset(int& x, int& y);
 
     // Lua API (C functions)
     static Engine* self(lua_State* L);
@@ -114,8 +115,8 @@ private:
     Clock::time_point start_;
     bool warnedKeyboard_ = false;
 
-    int jitterX_ = 0, jitterY_ = 0;  // configured range
-    int offX_ = 0, offY_ = 0;        // current random offset from the exact path (worker thread only)
+    double jitterMin_ = 0, jitterMax_ = 0;  // configured distance range in pixels
+    int offX_ = 0, offY_ = 0;                // current offset from the exact path (worker thread only)
     std::mt19937 rng_;
 
     std::mutex qmu_;
