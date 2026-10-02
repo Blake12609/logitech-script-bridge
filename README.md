@@ -170,8 +170,12 @@ What it does:
 | **ESP32-S3** (bridge firmware) | Mouse + keyboard. Phone into the board's **COM/UART** port, native USB port into the PC |
 | **Demo** | No hardware: every action is written to the log |
 
-What a phone can't do: it can't see the PC's keyboard or pointer. `IsModifierPressed` and
-`IsKeyLockOn` always return false. For `MoveMouseTo` and `GetMousePosition` you enter the PC's
+- **Ctrl, Shift, Alt and Caps / Num / Scroll Lock** can be switched on in the app, for scripts that
+  change options while you hold a key (`IsModifierPressed("ctrl")`) or use a lock key as an on/off
+  switch (`IsKeyLockOn("capslock")`). The script sees them; nothing is typed on the PC.
+
+What a phone can't do: it can't see the PC's keyboard or pointer, so the keys above stand in for
+the keyboard. For `MoveMouseTo` and `GetMousePosition` you enter the PC's
 screen size under Options; `MoveMouseTo` first pushes the pointer into the top-left corner and
 counts from there (exact only with *Enhance pointer precision* turned off in Windows).
 MAKCU and KMBox can't type keys; use an ESP32-S3 for that. There's no iPhone version because iOS

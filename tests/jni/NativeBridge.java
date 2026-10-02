@@ -15,6 +15,7 @@ public class NativeBridge {
     public static native void touchButton(int n, boolean pressed);
     public static native void gKey(int n, boolean pressed);
     public static native int buttonMask();
+    public static native void setKeys(int mask);
     public static native byte[] checkSyntax(byte[] script, byte[] name);
     public static void onWrite(byte[] b) { written.append(new String(b, StandardCharsets.UTF_8)); }
     public static void onLog(byte[] b) { logged.append(new String(b, StandardCharsets.UTF_8)); }
@@ -35,7 +36,9 @@ public class NativeBridge {
         Thread.sleep(150);
         check((buttonMask() & 0x08) != 0, "mask from stream");
         onSerialData(new byte[]{0x00});
+        setKeys(1);
         touchButton(4, true); touchButton(4, false); gKey(2, true);
+        setKeys(0);
         Thread.sleep(150);
         stop();
         check(!isRunning(), "stopped");

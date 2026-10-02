@@ -60,6 +60,11 @@ public:
     void onTouchButton(int n, bool pressed);  // on-screen mouse buttons, OnEvent numbering 1-5
     void onGKey(int n, bool pressed);
 
+    // Keys held or toggled on the phone's screen, for IsModifierPressed / IsKeyLockOn
+    // (the phone can't see the PC's keyboard). Ctrl/Shift/Alt count as both left and right.
+    enum Key { Ctrl = 1, Shift = 2, Alt = 4, CapsLock = 8, NumLock = 16, ScrollLock = 32 };
+    void setKeys(int mask);
+
     // Bits 0-4: buttons 1-5 held on the mouse or screen. Bits 8-12: held by the script.
     int buttonMask();
 

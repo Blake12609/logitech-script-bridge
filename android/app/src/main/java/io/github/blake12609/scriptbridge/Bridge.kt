@@ -81,6 +81,15 @@ object Bridge {
     /** Line of the last load error in [script], 0 if none. */
     var errorLine by mutableIntStateOf(0)
         private set
+    /** Ctrl/Shift/Alt and lock keys switched on in the app (NativeBridge.KEY_*). */
+    var keys by mutableIntStateOf(0)
+        private set
+
+    fun toggleKey(key: Int) {
+        keys = keys xor key
+        NativeBridge.setKeys(keys)
+    }
+
     /** Changes whenever the script library does. */
     var libraryVersion by mutableIntStateOf(0)
         private set

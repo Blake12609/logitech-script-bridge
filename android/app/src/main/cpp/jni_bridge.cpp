@@ -142,6 +142,10 @@ JNIEXPORT void JNICALL Java_io_github_blake12609_scriptbridge_NativeBridge_gKey(
     session().onGKey(n, pressed);
 }
 
+JNIEXPORT void JNICALL Java_io_github_blake12609_scriptbridge_NativeBridge_setKeys(JNIEnv*, jclass, jint mask) {
+    session().setKeys(mask);
+}
+
 JNIEXPORT jint JNICALL Java_io_github_blake12609_scriptbridge_NativeBridge_buttonMask(JNIEnv*, jclass) {
     return session().buttonMask();
 }

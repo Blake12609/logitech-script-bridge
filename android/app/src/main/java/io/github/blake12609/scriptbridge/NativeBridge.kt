@@ -26,6 +26,15 @@ object NativeBridge {
     @JvmStatic external fun touchButton(n: Int, pressed: Boolean)
     @JvmStatic external fun gKey(n: Int, pressed: Boolean)
 
+    /** On-screen keys for IsModifierPressed / IsKeyLockOn, bits as in MobileSession::Key. */
+    @JvmStatic external fun setKeys(mask: Int)
+    const val KEY_CTRL = 1
+    const val KEY_SHIFT = 2
+    const val KEY_ALT = 4
+    const val KEY_CAPSLOCK = 8
+    const val KEY_NUMLOCK = 16
+    const val KEY_SCROLLLOCK = 32
+
     /** Bits 0-4: buttons 1-5 held on the mouse or screen. Bits 8-12: held by the script. */
     @JvmStatic external fun buttonMask(): Int
 

@@ -340,6 +340,17 @@ private fun MouseCard(mask: Int) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             for (g in 1..6) GKey(g, Modifier.weight(1f))
         }
+        Text("Keyboard (tap to turn on or off)", color = C.muted, fontSize = 12.sp)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            KeyToggle("Ctrl", NativeBridge.KEY_CTRL, Modifier.weight(1f))
+            KeyToggle("Shift", NativeBridge.KEY_SHIFT, Modifier.weight(1f))
+            KeyToggle("Alt", NativeBridge.KEY_ALT, Modifier.weight(1f))
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            KeyToggle("Caps Lock", NativeBridge.KEY_CAPSLOCK, Modifier.weight(1f))
+            KeyToggle("Num Lock", NativeBridge.KEY_NUMLOCK, Modifier.weight(1f))
+            KeyToggle("Scroll Lock", NativeBridge.KEY_SCROLLLOCK, Modifier.weight(1f))
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
             Legend(filled = true, "pressed")
             Legend(filled = false, "held by script")
@@ -418,6 +429,29 @@ private fun GKey(n: Int, modifier: Modifier) {
         contentAlignment = Alignment.Center,
     ) {
         Text("G$n", color = if (down) Color.White else C.muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** A key the script sees as held (IsModifierPressed) or switched on (IsKeyLockOn). */
+@Composable
+private fun KeyToggle(label: String, key: Int, modifier: Modifier) {
+    val haptics = LocalHapticFeedback.current
+    val on = (Bridge.keys and key) != 0
+    val shape = RoundedCornerShape(10.dp)
+    Box(
+        modifier
+            .height(38.dp)
+            .clip(shape)
+            .background(if (on) C.accent.copy(alpha = 0.6f) else C.field)
+            .border(1.dp, if (on) C.accent else C.border, shape)
+            .clickable {
+                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                Bridge.toggleKey(key)
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = if (on) Color.White else C.muted, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+            maxLines = 1)
     }
 }
 

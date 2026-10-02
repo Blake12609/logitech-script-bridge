@@ -96,9 +96,20 @@ private:
 class MobileSession::Input : public InputState {
 public:
     explicit Input(Output& out) : out_(out) {}
-    // The phone can't see the PC's keyboard.
-    bool modifierPressed(const std::string&) override { return false; }
-    bool lockOn(const std::string&) override { return false; }
+    bool modifierPressed(const std::string& name) override {
+        const std::string side = name.size() > 1 ? name.substr(1) : name;  // "lctrl" -> "ctrl"
+        if (side == "ctrl") return keys & MobileSession::Ctrl;
+        if (side == "shift") return keys & MobileSession::Shift;
+        if (side == "alt") return keys & MobileSession::Alt;
+        return false;
+    }
+    bool lockOn(const std::string& name) override {
+        if (name == "capslock") return keys & MobileSession::CapsLock;
+        if (name == "numlock") return keys & MobileSession::NumLock;
+        if (name == "scrolllock") return keys & MobileSession::ScrollLock;
+        return false;
+    }
+    std::atomic<int> keys{0};
     void cursorPos(int& x, int& y) override { out_.pos(x, y); }
     void screenRect(bool, int& left, int& top, int& width, int& height) override {
         left = top = 0;
@@ -161,6 +172,8 @@ void MobileSession::onTouchButton(int n, bool pressed) {
 }
 
 void MobileSession::onGKey(int n, bool pressed) { engine_->onGKey(n, pressed); }
+
+void MobileSession::setKeys(int mask) { input_->keys = mask; }
 
 int MobileSession::buttonMask() {
     int mask = 0;

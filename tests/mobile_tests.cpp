@@ -223,3 +223,33 @@ TEST(phone_load_error_is_reported) {
     CHECK(p.error.find("phone.lua:1:") != std::string::npos);
     CHECK(!p.session.running());
 }
+
+TEST(phone_on_screen_modifiers_and_locks) {
+    Phone p;
+    CHECK(p.start(R"(
+    function OnEvent(event, arg)
+        if event == "MOUSE_BUTTON_PRESSED" and arg == 4 then
+            OutputLogMessage("ctrl=%s rctrl=%s shift=%s alt=%s caps=%s num=%s scroll=%s\n",
+                tostring(IsModifierPressed("ctrl")), tostring(IsModifierPressed("rctrl")),
+                tostring(IsModifierPressed("lshift")), tostring(IsModifierPressed("alt")),
+                tostring(IsKeyLockOn("capslock")), tostring(IsKeyLockOn("numlock")),
+                tostring(IsKeyLockOn("scrolllock")))
+        end
+    end)", MobileDevice::Demo));
+    p.session.onTouchButton(4, true);
+    p.session.onTouchButton(4, false);
+    test::sleepMs(50);
+    p.session.setKeys(MobileSession::Ctrl | MobileSession::CapsLock);
+    p.session.onTouchButton(4, true);
+    p.session.onTouchButton(4, false);
+    test::sleepMs(50);
+    p.session.setKeys(MobileSession::Shift | MobileSession::Alt | MobileSession::NumLock | MobileSession::ScrollLock);
+    p.session.onTouchButton(4, true);
+    p.session.onTouchButton(4, false);
+    test::sleepMs(50);
+    const std::string log = p.log();
+    CHECK(log.find("ctrl=false rctrl=false shift=false alt=false caps=false num=false scroll=false") != std::string::npos);
+    CHECK(log.find("ctrl=true rctrl=true shift=false alt=false caps=true num=false scroll=false") != std::string::npos);
+    CHECK(log.find("ctrl=false rctrl=false shift=true alt=true caps=false num=true scroll=true") != std::string::npos);
+    p.session.stop();
+}
