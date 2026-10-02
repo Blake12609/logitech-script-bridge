@@ -48,7 +48,7 @@ using std::min;
 
 namespace {
 
-const wchar_t* const kVersion = L"v1.5";
+const wchar_t* const kVersion = L"v1.6";
 
 // ------------------------------------------------------------------ theme
 
