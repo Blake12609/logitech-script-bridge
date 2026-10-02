@@ -1,4 +1,5 @@
 // firmware/esp32s3_bridge compiled against the mock ESP32 Arduino core.
+#define ARDUINO_USB_CDC_ON_BOOT 1  // the setting the sketch asks for
 #include "Arduino.h"
 #include "../../firmware/esp32s3_bridge/esp32s3_bridge.ino"
 #include "fw_link.h"
@@ -55,4 +56,20 @@ TEST(esp32_parser_edge_cases) {
     Serial.out.clear();
     feed("km.version()\n");
     CHECK(Serial.out.find("esp32s3") != std::string::npos);
+}
+
+TEST(esp32_takes_commands_on_the_uart_port_too) {
+    // the Android app talks to the board's COM/UART port while native USB goes to the PC
+    g_hid.clear();
+    Serial0.feed("km.move(5,6)\r\nkm.si");
+    loop();
+    Serial.feed("km.left(1)\r\n");  // a half-received UART line doesn't mix with USB input
+    loop();
+    Serial0.feed("de2(1)\r\nkm.version()\r\n");
+    Serial.out.clear();
+    Serial0.out.clear();
+    loop();
+    CHECK((g_hid == Hid{"move 5 6 0", "press 0x01", "press 0x10"}));
+    CHECK(Serial0.out.find("esp32s3") != std::string::npos);
+    CHECK(Serial.out.empty());
 }

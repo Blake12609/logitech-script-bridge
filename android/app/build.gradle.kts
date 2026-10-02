@@ -24,7 +24,13 @@ android {
 
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
     // use the NDK that's already installed (GitHub's runners set this) instead of downloading one
-    System.getenv("ANDROID_NDK_HOME")?.let { if (file(it).isDirectory) ndkPath = it }
+    System.getenv("ANDROID_NDK_HOME")?.let { path ->
+        val props = file("$path/source.properties")
+        if (props.isFile) {
+            ndkPath = path
+            ndkVersion = props.readLines().first { it.startsWith("Pkg.Revision") }.substringAfter("=").trim()
+        }
+    }
 
     signingConfigs {
         create("release") {

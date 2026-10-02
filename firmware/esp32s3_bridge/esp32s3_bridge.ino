@@ -15,6 +15,10 @@
 //   USB CDC On Boot: Enabled
 // Plug the board's native USB port ("USB", not "COM/UART") into the PC.
 // It shows up as a serial port (for the app) and as a mouse + keyboard.
+//
+// The same commands are also accepted on the board's COM/UART port (115200 baud),
+// so a phone running the Android app can plug in there while the native USB
+// port stays in the PC.
 
 #include "USB.h"
 #include "USBHIDMouse.h"
@@ -23,8 +27,16 @@
 USBHIDMouse Mouse;
 USBHIDKeyboard Keyboard;
 
-static char line[64];
-static size_t lineLen = 0;
+// A command line being received on one serial port.
+struct LineBuffer {
+  char text[64];
+  size_t len;
+};
+
+static LineBuffer usbLine = {{0}, 0};
+#if ARDUINO_USB_CDC_ON_BOOT
+static LineBuffer uartLine = {{0}, 0};
+#endif
 
 static void moveBy(long dx, long dy) {
   // HID reports carry at most +-127 per axis, so split large moves.
@@ -63,7 +75,8 @@ static int parse(const char *s, char *name, size_t nameSize, long *args, int max
   return count;
 }
 
-static void handle(const char *cmd) {
+// Runs one command; replies (km.version) go back to the port it came from.
+static void handle(const char *cmd, Stream &port) {
   char name[16];
   long a[2] = {0, 0};
   int n = parse(cmd, name, sizeof(name), a, 2);
@@ -78,27 +91,37 @@ static void handle(const char *cmd) {
   else if (!strcmp(name, "km.side2") && n == 1) setButton(MOUSE_FORWARD, a[0]);
   else if (!strcmp(name, "kb.down") && n == 1) Keyboard.pressRaw((uint8_t)a[0]);
   else if (!strcmp(name, "kb.up") && n == 1) Keyboard.releaseRaw((uint8_t)a[0]);
-  else if (!strcmp(name, "km.version")) Serial.println("logitech-script-bridge esp32s3 1.0");
+  else if (!strcmp(name, "km.version")) port.println("logitech-script-bridge esp32s3 1.1");
+}
+
+static void pump(Stream &port, LineBuffer &buf) {
+  while (port.available()) {
+    char c = port.read();
+    if (c == '\r' || c == '\n') {
+      if (buf.len) {
+        buf.text[buf.len] = 0;
+        handle(buf.text, port);
+        buf.len = 0;
+      }
+    } else if (buf.len < sizeof(buf.text) - 1) {
+      buf.text[buf.len++] = c;
+    }
+  }
 }
 
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial0.begin(115200);
+#endif
   Mouse.begin();
   Keyboard.begin();
   USB.begin();
 }
 
 void loop() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\r' || c == '\n') {
-      if (lineLen) {
-        line[lineLen] = 0;
-        handle(line);
-        lineLen = 0;
-      }
-    } else if (lineLen < sizeof(line) - 1) {
-      line[lineLen++] = c;
-    }
-  }
+  pump(Serial, usbLine);
+#if ARDUINO_USB_CDC_ON_BOOT
+  pump(Serial0, uartLine);
+#endif
 }
