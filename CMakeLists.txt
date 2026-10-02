@@ -34,7 +34,8 @@ else()
   target_compile_options(lua PRIVATE -w)
 endif()
 
-add_library(bridge_core STATIC src/engine.cpp src/keys.cpp src/backend.cpp src/serial.cpp src/config.cpp)
+add_library(bridge_core STATIC src/engine.cpp src/keys.cpp src/backend.cpp src/serial.cpp src/config.cpp
+            src/mobile_session.cpp)
 target_include_directories(bridge_core PUBLIC src)
 target_link_libraries(bridge_core PUBLIC lua)
 find_package(Threads REQUIRED)
@@ -58,7 +59,8 @@ enable_testing()
 add_library(test_main STATIC tests/test_main.cpp)
 target_include_directories(test_main PUBLIC tests)
 
-add_executable(bridge_tests tests/engine_tests.cpp tests/config_tests.cpp tests/serial_tests.cpp)
+add_executable(bridge_tests tests/engine_tests.cpp tests/config_tests.cpp tests/serial_tests.cpp
+               tests/mobile_tests.cpp)
 target_link_libraries(bridge_tests PRIVATE bridge_core test_main)
 add_test(NAME bridge_tests COMMAND bridge_tests)
 

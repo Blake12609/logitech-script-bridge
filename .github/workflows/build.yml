@@ -51,9 +51,40 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -S . -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
 
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # an optional signing key from the repo's secrets replaces app/release.jks
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            export ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
+          else
+            unset ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
+          fi
+          ./gradlew --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../LogitechScriptBridge-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LogitechScriptBridge-android
+          path: LogitechScriptBridge-android.apk
+
   release:
     if: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
-    needs: [windows, linux-tests]
+    needs: [windows, linux-tests, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,4 +106,5 @@ jobs:
           files: |
             LogitechScriptBridge-x64.exe
             LogitechScriptBridge-x86.exe
+            LogitechScriptBridge-android.apk
             LogitechScriptBridge-${{ env.VERSION }}.zip

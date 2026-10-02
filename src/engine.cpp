@@ -134,10 +134,13 @@ bool Engine::start(const std::string& source, const std::string& chunkName, std:
     warnedKeyboard_ = false;
     offX_ = offY_ = 0;
     start_ = Clock::now();
-    physical_.fill(false);
-    synthetic_.fill(false);
-    extra_.fill(false);
-    for (auto& e : echo_) e.clear();
+    {
+        std::lock_guard<std::mutex> lock(smu_);  // input can arrive from another thread
+        physical_.fill(false);
+        synthetic_.fill(false);
+        extra_.fill(false);
+        for (auto& e : echo_) e.clear();
+    }
 
     std::string loadError;
     bool ready = false;
@@ -466,7 +469,7 @@ int Engine::l_mbutton(lua_State* L) {
     const bool down = lua_toboolean(L, 2);
     {
         std::lock_guard<std::mutex> lock(e->smu_);
-        e->echo_[static_cast<int>(b)].push_back({down, Clock::now() + kEchoWindow});
+        if (e->expectEchoes_) e->echo_[static_cast<int>(b)].push_back({down, Clock::now() + kEchoWindow});
         e->synthetic_[static_cast<int>(b)] = down;
     }
     e->out_.button(b, down);
@@ -502,6 +505,7 @@ int Engine::l_moveTo(lua_State* L) {
     Engine* e = self(L);
     int left, top, w, h;
     e->input_.screenRect(lua_toboolean(L, 3), left, top, w, h);
+    e->input_.beforeMoveTo();
     // with randomizing on, aim for a spot near the target; later relative moves wobble around it
     e->pickOffset(e->offX_, e->offY_);
     const int tx = left + static_cast<int>(std::lround(luaL_checknumber(L, 1) * (w - 1) / 65535.0)) + e->offX_;

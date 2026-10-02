@@ -1,0 +1,17 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- mouse outline and wheel, inside the 66dp safe zone -->
+    <path
+        android:pathData="M41,45a13,13 0,0 1,26 0v18a13,13 0,0 1,-26 0z"
+        android:strokeWidth="4.5"
+        android:strokeColor="#FFFFFFFF"
+        android:fillColor="#00000000" />
+    <path
+        android:pathData="M54,38v8"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round"
+        android:strokeColor="#FFFFFFFF" />
+</vector>

@@ -29,6 +29,8 @@ public:
     virtual bool lockOn(const std::string& name) = 0;           // capslock, numlock, scrolllock
     virtual void cursorPos(int& x, int& y) = 0;
     virtual void screenRect(bool virtualDesktop, int& left, int& top, int& width, int& height) = 0;
+    // Called before MoveMouseTo steers the pointer, e.g. to put it in a known spot first.
+    virtual void beforeMoveTo() {}
 };
 
 class Engine {
@@ -57,6 +59,10 @@ public:
     // where the script asked, in a random direction. The pointer wobbles around the
     // path instead of drifting away from it. maxPx 0 = off. Call before start().
     void setJitter(double minPx, double maxPx, unsigned seed = std::random_device{}());
+
+    // Whether clicks the script sends come back as physical button events (they do
+    // through a PC's input hook). Off when the button source only sees the real mouse.
+    void setExpectEchoes(bool on) { expectEchoes_ = on; }
 
     // Button n (OnEvent numbering 1-5): held on the real mouse / held by the script.
     void buttonState(int n, bool& physical, bool& script);
@@ -120,6 +126,7 @@ private:
     Clock::time_point deadline_;
     Clock::time_point start_;
     bool warnedKeyboard_ = false;
+    std::atomic<bool> expectEchoes_{true};
 
     double jitterMin_ = 0, jitterMax_ = 0;  // configured distance range in pixels
     int offX_ = 0, offY_ = 0;                // current offset from the exact path (worker thread only)
