@@ -28,7 +28,7 @@ public class NativeBridge {
         check(checkSyntax(u("x = 1"), u("t.lua")).length == 0, "syntax ok");
         String err = start(u("function OnEvent("), u("bad.lua"), 3, 0, 0, 1920, 1080);
         check(err != null && err.startsWith("bad.lua:1:"), "load error " + err);
-        String script = "function OnEvent(e, a)\n OutputLogMessage(\"ev %s %d \\u{2713}\\n\", e, a)\n" +
+        String script = "function OnEvent(e, a)\n OutputLogMessage(\"ev %s %d \\u{2713} ctrl=%s caps=%s\\n\", e, a, tostring(IsModifierPressed(\"lctrl\")), tostring(IsKeyLockOn(\"capslock\")))\n" +
             " if e == \"MOUSE_BUTTON_PRESSED\" and a == 4 then PressAndReleaseMouseButton(1) ClearLog() end\nend";
         check(start(u(script), u("ok.lua"), 0, 0, 0, 1920, 1080) == null, "start");
         check(isRunning(), "running");
@@ -36,8 +36,9 @@ public class NativeBridge {
         Thread.sleep(150);
         check((buttonMask() & 0x08) != 0, "mask from stream");
         onSerialData(new byte[]{0x00});
-        setKeys(1);
+        setKeys(1 | 8);  // ctrl + caps lock, as the app's toggles set them
         touchButton(4, true); touchButton(4, false); gKey(2, true);
+        Thread.sleep(150);
         setKeys(0);
         Thread.sleep(150);
         stop();
@@ -45,7 +46,8 @@ public class NativeBridge {
         System.out.println("written=" + written.toString().replace("\r\n", "|"));
         System.out.println("log=" + logged);
         check(written.toString().equals("km.left(1)\r\nkm.left(0)\r\nkm.left(1)\r\nkm.left(0)\r\n"), "writes");
-        check(logged.toString().contains("ev G_PRESSED 2 ✓"), "utf8 log");
+        check(logged.toString().contains("ev G_PRESSED 2 ✓ ctrl=true caps=true"), "utf8 log, keys from setKeys");
+        check(logged.toString().contains("ev PROFILE_ACTIVATED 0 ✓ ctrl=false caps=false"), "keys off before setKeys");
         check(clears == 2, "clear log callbacks");
     }
 }

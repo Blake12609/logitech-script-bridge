@@ -340,7 +340,7 @@ private fun MouseCard(mask: Int) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             for (g in 1..6) GKey(g, Modifier.weight(1f))
         }
-        Text("Keyboard (tap to turn on or off)", color = C.muted, fontSize = 12.sp)
+        Text("Keyboard: hold a key, or tap it to keep it on", color = C.muted, fontSize = 12.sp)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             KeyToggle("Ctrl", NativeBridge.KEY_CTRL, Modifier.weight(1f))
             KeyToggle("Shift", NativeBridge.KEY_SHIFT, Modifier.weight(1f))
@@ -432,7 +432,10 @@ private fun GKey(n: Int, modifier: Modifier) {
     }
 }
 
-/** A key the script sees as held (IsModifierPressed) or switched on (IsKeyLockOn). */
+/**
+ * A key the script sees as held (IsModifierPressed) or switched on (IsKeyLockOn).
+ * It's on while a finger is on it; a quick tap keeps it on until the next tap.
+ */
 @Composable
 private fun KeyToggle(label: String, key: Int, modifier: Modifier) {
     val haptics = LocalHapticFeedback.current
@@ -444,9 +447,20 @@ private fun KeyToggle(label: String, key: Int, modifier: Modifier) {
             .clip(shape)
             .background(if (on) C.accent.copy(alpha = 0.6f) else C.field)
             .border(1.dp, if (on) C.accent else C.border, shape)
-            .clickable {
-                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                Bridge.toggleKey(key)
+            .pointerInput(key) {
+                detectTapGestures(onPress = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    val wasOn = (Bridge.keys and key) != 0
+                    Bridge.setKey(key, true)  // held from the moment it's touched
+                    val down = System.currentTimeMillis()
+                    try {
+                        tryAwaitRelease()
+                    } finally {
+                        val tap = System.currentTimeMillis() - down < 300
+                        // tap: switch on (latched) or off; hold: only while held
+                        if (wasOn || !tap) Bridge.setKey(key, false)
+                    }
+                })
             },
         contentAlignment = Alignment.Center,
     ) {

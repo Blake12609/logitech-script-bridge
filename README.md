@@ -170,7 +170,7 @@ What it does:
 | **ESP32-S3** (bridge firmware) | Mouse + keyboard. Phone into the board's **COM/UART** port, native USB port into the PC |
 | **Demo** | No hardware: every action is written to the log |
 
-- **Ctrl, Shift, Alt and Caps / Num / Scroll Lock** can be switched on in the app, for scripts that
+- **Ctrl, Shift, Alt and Caps / Num / Scroll Lock** can be held on the screen (or tapped to keep them on), for scripts that
   change options while you hold a key (`IsModifierPressed("ctrl")`) or use a lock key as an on/off
   switch (`IsKeyLockOn("capslock")`). The script sees them; nothing is typed on the PC.
 

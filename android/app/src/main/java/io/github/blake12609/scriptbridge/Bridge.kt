@@ -85,8 +85,8 @@ object Bridge {
     var keys by mutableIntStateOf(0)
         private set
 
-    fun toggleKey(key: Int) {
-        keys = keys xor key
+    fun setKey(key: Int, on: Boolean) {
+        keys = if (on) keys or key else keys and key.inv()
         NativeBridge.setKeys(keys)
     }
 
