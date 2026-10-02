@@ -6,12 +6,14 @@
 
 <p align="center">
   Run <b>Logitech G HUB / LGS Lua scripts</b> with <b>any mouse</b>, sending the output through a MAKCU, KMBox, ESP32-S3, Arduino or Raspberry Pi Pico.
+  From a Windows PC, or from an <b>Android phone</b> plugged into a MAKCU.
 </p>
 
 <p align="center">
   <a href="https://github.com/Blake12609/logitech-script-bridge/releases/latest"><img src="https://img.shields.io/github/v/release/Blake12609/logitech-script-bridge?label=download&color=4f8cff" alt="latest release"></a>
   <a href="https://github.com/Blake12609/logitech-script-bridge/actions/workflows/build.yml"><img src="https://github.com/Blake12609/logitech-script-bridge/actions/workflows/build.yml/badge.svg" alt="build"></a>
   <img src="https://img.shields.io/badge/Windows-64--bit%20%7C%2032--bit-0078d4" alt="Windows 64-bit and 32-bit">
+  <img src="https://img.shields.io/badge/Android-8%2B-3ddc84" alt="Android 8 and newer">
   <img src="https://img.shields.io/badge/portable-no%20install-3fb950" alt="portable">
 </p>
 
@@ -40,6 +42,7 @@ Get the latest version from the **[Releases page](https://github.com/Blake12609/
 |------|-----|
 | `LogitechScriptBridge-x64.exe` | 64-bit Windows (almost every PC) |
 | `LogitechScriptBridge-x86.exe` | 32-bit Windows |
+| `LogitechScriptBridge-android.apk` | Android 8 or newer, see [Android app](#android-app) |
 | `LogitechScriptBridge-vX.Y.Z.zip` | Both exes, example scripts, firmware and an empty `scripts\` + `configs\` folder |
 
 Windows SmartScreen may warn because the exe isn't code-signed: click *More info* and then *Run anyway*.
@@ -127,6 +130,52 @@ hand-drawn look. The pointer wobbles around the path the script asked for and ne
 even over long strokes. Set Max to 0 (the default) for exact movement.
 Try [`examples/paint_draw_line.lua`](examples/paint_draw_line.lua) with Min 1, Max 4.
 
+## Android app
+
+The phone can be the brain instead of the PC: it runs the script and drives a MAKCU over a USB OTG cable.
+The PC just sees a mouse and needs no software at all.
+
+```
+mouse ──► MAKCU ──► PC            the PC only sees a normal mouse
+            ▲
+            │ USB OTG (the MAKCU's COM port)
+          phone running Script Bridge
+```
+
+1. Install `LogitechScriptBridge-android.apk` from the [Releases page](https://github.com/Blake12609/logitech-script-bridge/releases/latest).
+   Android asks you to allow installing apps from your browser or file manager the first time.
+2. Plug the MAKCU into the PC as usual and your mouse into the MAKCU. Then connect the MAKCU's **COM** port
+   to the phone with a USB-C OTG cable or adapter. Android offers to open Script Bridge: tick *Always*
+   and it connects by itself from then on (or press **Connect**).
+3. Pick a script: **Open** a `.lua` file, choose one under **Scripts** (the examples are built in) or
+   write a **New** one. Press **Start**.
+
+What it does:
+
+- **Your real mouse buttons trigger the script.** The app reads them through the MAKCU (`km.buttons`),
+  so side-button scripts behave as they do on a Logitech mouse. The buttons light up on the Mouse card.
+- **On-screen buttons**: hold any button of the mouse picture (1–5) or G1–G6 to trigger the script.
+  Handy for testing, and for devices that can't report the mouse's buttons.
+- **Editor** with the same syntax colouring, line numbers, auto-indent and live syntax check as the
+  PC app, plus a row of keys that are awkward on a phone keyboard (`( ) " = ~= end then`…). Saving a
+  running script restarts it with the new code.
+- **Keeps running with the screen off**; a notification shows the script and has a Stop button.
+- **Randomize movement** works as on the PC.
+
+| Device | On the phone |
+|---|---|
+| **MAKCU** | Mouse output, and your real mouse buttons trigger the script |
+| **KMBox B / B+ / B Pro** | Mouse output; trigger the script with the on-screen buttons |
+| **ESP32-S3** (bridge firmware) | Mouse + keyboard. Phone into the board's **COM/UART** port, native USB port into the PC |
+| **Demo** | No hardware: every action is written to the log |
+
+What a phone can't do: it can't see the PC's keyboard or pointer. `IsModifierPressed` and
+`IsKeyLockOn` always return false. For `MoveMouseTo` and `GetMousePosition` you enter the PC's
+screen size under Options; `MoveMouseTo` first pushes the pointer into the top-left corner and
+counts from there (exact only with *Enhance pointer precision* turned off in Windows).
+MAKCU and KMBox can't type keys; use an ESP32-S3 for that. There's no iPhone version because iOS
+doesn't let apps talk to USB serial devices.
+
 ## How scripts behave (same as G HUB)
 
 - `OnEvent(event, arg, family)` receives `PROFILE_ACTIVATED`, `PROFILE_DEACTIVATED`,
@@ -176,7 +225,9 @@ Both firmwares make the board a USB mouse and keyboard that takes commands over 
 
 **ESP32-S3**: open [`firmware/esp32s3_bridge/esp32s3_bridge.ino`](firmware/esp32s3_bridge/esp32s3_bridge.ino) in the Arduino IDE
 with the ESP32 board package. Choose board **ESP32S3 Dev Module**, *USB Mode: USB-OTG (TinyUSB)* and
-*USB CDC On Boot: Enabled*, then upload. Use the board's native **USB** port (not *COM/UART*).
+*USB CDC On Boot: Enabled*, then upload. Plug the board's native **USB** port (not *COM/UART*) into the PC.
+For the Android app, plug the phone into the board's **COM/UART** port: the firmware takes the same
+commands there (115200 baud).
 
 **Arduino Leonardo / Micro / Pro Micro / Raspberry Pi Pico**: open
 [`firmware/arduino_hid_bridge/arduino_hid_bridge.ino`](firmware/arduino_hid_bridge/arduino_hid_bridge.ino),
@@ -201,8 +252,12 @@ The tests run on every push, on Windows (64-bit and 32-bit) and Linux:
   A Lua script runs in the real engine, its commands are fed into the firmware, and the test
   checks the USB mouse and keyboard actions that come out.
 - **Configs**: save/load round trips, relative paths and hand-edited files.
+- **Phone**: the MAKCU button stream parser (including button masks that look like line breaks),
+  scripts driven by the stream and by on-screen buttons, `MoveMouseTo` from the corner, and the
+  JNI layer driven from Java with `-Xcheck:jni`. The APK is built on every run.
 
-The GUI has been exercised under Wine. **None of the devices has been tested on
+The Windows GUI has been exercised under Wine. The Android app is built and its engine is tested,
+but it has not been run on a phone yet. **None of the devices has been tested on
 physical hardware yet.** If you try one, please open an issue saying whether it worked.
 
 ## Limitations
@@ -235,6 +290,12 @@ cmake -S . -B build-win32 -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-i686.cmake && c
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
+The Android app is in `android/` (Kotlin + Jetpack Compose, with the same C++ engine through the NDK).
+Open that folder in Android Studio, or run `./gradlew assembleRelease` there with the Android SDK and NDK installed.
+Release APKs are signed with `android/app/release.jks`, so a new version installs over the old one.
+In a fork, add your own key as the secrets `ANDROID_KEYSTORE_B64` (the keystore, base64),
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`.
+
 To publish a release, open **Actions → build → Run workflow** and enter a version (e.g. `v1.2.0`), or push a `v*` tag.
 
 ```
@@ -246,11 +307,13 @@ src/
   keys.cpp         key names <-> scancodes <-> HID usage IDs
   platform_win.cpp mouse/keyboard hooks, keyboard state, SendInput output
   gui_win.cpp      the window
+  mobile_session.cpp  the phone version: MAKCU button stream, pointer tracking
+android/               the Android app (Kotlin UI, JNI glue in app/src/main/cpp)
 firmware/
   esp32s3_bridge/      ESP32-S3 sketch
   arduino_hid_bridge/  Leonardo / Pro Micro / Pi Pico sketch
 examples/              sample scripts
-tests/                 engine, config, serial and firmware tests
+tests/                 engine, config, serial, phone and firmware tests
 ```
 
 ## License

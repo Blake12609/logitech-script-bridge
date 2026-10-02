@@ -22,6 +22,9 @@ if(MINGW)
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
+# Position-independent so the JNI test library below can link them.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Lua 5.4, compiled as C++ so script errors unwind with exceptions.
 file(GLOB LUA_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/*.c)
 set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
@@ -71,3 +74,18 @@ foreach(fw esp32 arduino)
   target_link_libraries(${fw}_fw_tests PRIVATE bridge_core test_main)
   add_test(NAME ${fw}_fw_tests COMMAND ${fw}_fw_tests)
 endforeach()
+
+# The Android app's JNI layer, built for the PC and driven from Java with the
+# same method signatures as NativeBridge.kt.
+if(NOT WIN32)
+  find_package(Java QUIET COMPONENTS Development Runtime)
+  find_package(JNI QUIET)
+endif()
+if(Java_FOUND AND JNI_FOUND)
+  add_library(scriptbridge_jni SHARED android/app/src/main/cpp/jni_bridge.cpp)
+  target_include_directories(scriptbridge_jni PRIVATE ${JNI_INCLUDE_DIRS})
+  target_link_libraries(scriptbridge_jni PRIVATE bridge_core)
+  set_target_properties(scriptbridge_jni PROPERTIES OUTPUT_NAME scriptbridge)
+  add_test(NAME jni_tests COMMAND sh -c
+    "'${Java_JAVAC_EXECUTABLE}' -d jni_classes '${CMAKE_CURRENT_SOURCE_DIR}/tests/jni/NativeBridge.java' && '${Java_JAVA_EXECUTABLE}' -Xcheck:jni -Djava.library.path='$<TARGET_FILE_DIR:scriptbridge_jni>' -cp jni_classes io.github.blake12609.scriptbridge.NativeBridge")
+endif()
