@@ -77,14 +77,49 @@ jobs:
           fi
           ./gradlew --no-daemon assembleRelease
           cp app/build/outputs/apk/release/app-release.apk ../LogitechScriptBridge-android.apk
+      - name: Check APK
+        run: |
+          # the engine for every ABI, the JNI entry points, and the Kotlin methods C++ calls by name
+          unzip -l LogitechScriptBridge-android.apk | tee apk.txt
+          for abi in arm64-v8a armeabi-v7a x86_64; do grep -q "lib/$abi/libscriptbridge.so" apk.txt; done
+          unzip -o -q LogitechScriptBridge-android.apk 'lib/arm64-v8a/*' -d apk
+          syms=$("$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm -D --defined-only apk/lib/arm64-v8a/libscriptbridge.so)
+          for f in JNI_OnLoad NativeBridge_start NativeBridge_stop NativeBridge_onSerialData NativeBridge_checkSyntax; do
+            echo "$syms" | grep -q "$f" || { echo "missing $f"; exit 1; }
+          done
+          map=android/app/build/outputs/mapping/release/mapping.txt
+          grep -q "^io.github.blake12609.scriptbridge.NativeBridge -> io.github.blake12609.scriptbridge.NativeBridge:" $map
+          for m in onWrite onLog onClearLog; do grep -Eq "$m\((byte\[\])?\)[0-9:]* -> $m$" $map || { echo "R8 renamed $m"; exit 1; }; done
       - uses: actions/upload-artifact@v4
         with:
           name: LogitechScriptBridge-android
           path: LogitechScriptBridge-android.apk
 
+  android-smoke:
+    needs: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: LogitechScriptBridge-android
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the app on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: python3 tests/android/smoke.py LogitechScriptBridge-android.apk
+
   release:
     if: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
-    needs: [windows, linux-tests, android]
+    needs: [windows, linux-tests, android, android-smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
