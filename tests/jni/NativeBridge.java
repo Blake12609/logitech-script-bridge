@@ -22,7 +22,7 @@ public class NativeBridge {
     static byte[] u(String s) { return s.getBytes(StandardCharsets.UTF_8); }
     static void check(boolean c, String what) { if (!c) { System.out.println("FAIL " + what); System.exit(1); } System.out.println("ok " + what); }
     public static void main(String[] a) throws Exception {
-        check(new String(connectCommands(0), "UTF-8").equals("km.echo(0)\r\nkm.buttons(1)\r\n"), "connect commands");
+        check(new String(connectCommands(0), "UTF-8").equals("km.buttons(1)\r\n"), "connect commands");
         check(new String(checkSyntax(u("x = = 1"), u("t.lua")), "UTF-8").startsWith("t.lua:1:"), "syntax error");
         check(checkSyntax(u("x = 1"), u("t.lua")).length == 0, "syntax ok");
         String err = start(u("function OnEvent("), u("bad.lua"), 3, 0, 0, 1920, 1080);

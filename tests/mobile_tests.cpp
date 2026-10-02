@@ -213,7 +213,7 @@ TEST(phone_demo_mode_logs_instead_of_sending) {
 }
 
 TEST(phone_connect_commands) {
-    CHECK(MobileSession::connectCommands(MobileDevice::Makcu) == "km.echo(0)\r\nkm.buttons(1)\r\n");
+    CHECK(MobileSession::connectCommands(MobileDevice::Makcu) == "km.buttons(1)\r\n");
     CHECK(MobileSession::connectCommands(MobileDevice::Esp32).empty());
 }
 

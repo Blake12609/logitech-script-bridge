@@ -132,7 +132,7 @@ void MobileSession::setDevice(MobileDevice d) {
 }
 
 std::string MobileSession::connectCommands(MobileDevice d) {
-    if (d == MobileDevice::Makcu) return "km.echo(0)\r\nkm.buttons(1)\r\n";
+    if (d == MobileDevice::Makcu) return "km.buttons(1)\r\n";
     return "";
 }
 

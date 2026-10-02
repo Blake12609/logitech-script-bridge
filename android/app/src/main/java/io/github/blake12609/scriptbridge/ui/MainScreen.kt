@@ -281,7 +281,7 @@ private fun DeviceCard() {
                     ) { Text("Disconnect", color = C.text) }
                 }
             }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (info.id != NativeBridge.MAKCU) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("Baud", color = C.muted, fontSize = 13.sp, modifier = Modifier.width(52.dp))
                 Dropdown(
                     options = Bridge.baudRates, selected = Bridge.baud, label = { it.toString() },

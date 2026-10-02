@@ -90,6 +90,14 @@ class UsbLink(private val context: Context) {
         val p = driver.ports[0]
         try {
             p.open(connection)
+            if (pendingDevice == NativeBridge.MAKCU) {
+                // Like MAKCU's own library: ask for 4 Mbaud at the power-on speed, then switch.
+                // A MAKCU that is already at 4 Mbaud just ignores the request.
+                p.setParameters(115200, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+                p.write(MAKCU_4M, WRITE_TIMEOUT_MS)
+                Thread.sleep(30)
+                pendingBaud = 4000000
+            }
             p.setParameters(pendingBaud, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
         } catch (e: Exception) {
             runCatching { p.close() }
@@ -160,5 +168,6 @@ class UsbLink(private val context: Context) {
     companion object {
         const val ACTION_PERMISSION = "io.github.blake12609.scriptbridge.USB_PERMISSION"
         private const val WRITE_TIMEOUT_MS = 500
+        private val MAKCU_4M = byteArrayOf(0xDE.toByte(), 0xAD.toByte(), 0x05, 0x00, 0xA5.toByte(), 0x00, 0x09, 0x3D, 0x00)
     }
 }

@@ -145,7 +145,8 @@ mouse ──► MAKCU ──► PC            the PC only sees a normal mouse
 1. Install `LogitechScriptBridge-android.apk` from the [Releases page](https://github.com/Blake12609/logitech-script-bridge/releases/latest).
    Android asks you to allow installing apps from your browser or file manager the first time.
 2. Plug the MAKCU into the PC as usual and your mouse into the MAKCU. Then connect the MAKCU's **COM** port
-   to the phone with a USB-C OTG cable or adapter. Android offers to open Script Bridge: tick *Always*
+   to the phone with a USB-C OTG cable or adapter. The app switches the MAKCU to 4 Mbaud by itself,
+   like MAKCU's own software does. Android offers to open Script Bridge: tick *Always*
    and it connects by itself from then on (or press **Connect**).
 3. Pick a script: **Open** a `.lua` file, choose one under **Scripts** (the examples are built in) or
    write a **New** one. Press **Start**.
